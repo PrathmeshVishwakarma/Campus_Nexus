@@ -173,8 +173,8 @@ export default function Files() {
   }
 
   return (
-    <div className="p-4 sm:p-6 max-w-7xl mx-auto grid lg:grid-cols-3 gap-4">
-      <Card className="p-4 lg:col-span-1">
+    <div className="mx-auto w-full max-w-7xl px-4 sm:px-6 py-6 grid lg:grid-cols-3 gap-4 items-start">
+      <Card className="lg:col-span-1">
         <h1 className="text-xl font-bold tracking-tight mb-1">Shared folders</h1>
         <p className="text-xs text-[var(--muted)] mb-3">Folder tree of everything synced on this node.</p>
         <div className="flex gap-2 mb-3">
@@ -237,7 +237,7 @@ export default function Files() {
         </div>
       </Card>
 
-      <Card className="p-4 lg:col-span-2">
+      <Card className="lg:col-span-2">
         {!selected ? (
           <div className="h-full min-h-[300px] flex items-center justify-center text-sm text-[var(--muted)] text-center p-8">
             Select a file on the left to see versions, download, resolve conflicts, and its comment thread.

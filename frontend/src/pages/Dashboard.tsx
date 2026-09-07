@@ -77,47 +77,48 @@ export function Dashboard() {
         />
 
         <div className="relative z-10 min-h-screen">
-          <header className="py-6 sm:py-8 border-b border-[var(--border)] backdrop-blur-lg bg-[var(--card)]">
-            <div className="max-w-7xl mx-auto flex items-center gap-3 flex-wrap">
-              <h1 className="text-4xl font-extrabold tracking-tight">
-                Campus Nexus <span className="text-[var(--accent)]">live</span>
-              </h1>
+          <header className="border-b border-[var(--border)] backdrop-blur-lg bg-[var(--card)]">
+            <div className="mx-auto w-full max-w-7xl px-4 sm:px-6 py-6 sm:py-8">
+              <div className="flex items-center gap-3 flex-wrap">
+                <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight">
+                  Campus Nexus <span className="text-[var(--accent)]">live</span>
+                </h1>
 
-              <div className="flex items-center gap-2 bg-[var(--card-hover)] rounded-xl px-3 py-1.5">
-                <Search size={14} className="text-muted-foreground" />
-                <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search events, actors, files…" className="bg-transparent outline-none text-sm flex-1 placeholder-[var(--muted)] focus:outline-none" />
+                <div className="flex items-center gap-2 bg-[var(--card-hover)] rounded-xl px-3 py-1.5 min-w-0 flex-1 sm:max-w-xs">
+                  <Search size={14} className="text-muted-foreground shrink-0" />
+                  <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search events, actors, files…" className="bg-transparent outline-none text-sm w-full placeholder-[var(--muted)] focus:outline-none" />
+                </div>
+
+                <button onClick={() => setLight(v => !v)} className="ml-auto rounded-lg p-2 transition-colors hover:bg-[rgba(167,139,250,0.25)]" aria-label="Toggle theme">
+                  {light ? <Moon size={15} className="text-[var(--muted)]" /> : <Sun size={15} className="text-[var(--accent)]" />}
+                </button>
               </div>
 
-              <button onClick={() => setLight(v => !v)} className="rounded-lg px-2.5 transition-colors [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg]:fill-current [&:hover]:bg-[rgba(167,139,250,0.25)]">
-                {light ? <Moon size={14} className="text-[var(--muted)]" /> : <Sun size={14} className="text-[var(--accent)]" />}
-              </button>
+              <p className="mt-2 text-sm text-[var(--muted)]">
+                Welcome back, <span className="font-medium">{user || ''}</span>
+              </p>
             </div>
-
-            <p className="mt-2 text-[var(--muted)]">
-              Welcome back, <span className="font-medium">{user || ''}</span>
-            </p>
           </header>
 
-          <main className="pt-6 pb-8">
-            <div className="max-w-7xl mx-auto">
+          <main className="mx-auto w-full max-w-7xl px-4 sm:px-6 py-6">
+            <div className="space-y-4">
 
-              <Card className="mb-6">
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+              <Card>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
                   {tiles.map((t, i) => (
-                    <Card key={`${t.icon}-${i}`} className="p-4 flex flex-col items-center gap-2">
+                    <Card key={`${t.icon}-${i}`} className="p-4 flex flex-col items-center gap-1.5 text-center">
                       <t.icon key="icon" size={16} className="text-[var(--accent)]" />
-                      <div>
-                        <div className="text-2xl font-bold">{t.getVal()}</div>
-                        <div className="text-[var(--muted)] text-sm">{t.label}</div>
-                      </div>
+                      <div className="text-2xl font-bold leading-none">{t.getVal()}</div>
+                      <div className="text-[var(--muted)] text-xs sm:text-sm">{t.label}</div>
                     </Card>
                   ))}
                 </div>
               </Card>
 
-              <Card className="mb-6">
-                <h2 className="font-semibold tracking-tight mb-3">Open a workspace</h2>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <Card>
+                <h2 className="text-lg font-bold tracking-tight mb-1">Open a workspace</h2>
+                <p className="text-sm text-[var(--muted)] mb-3">Jump straight into files, chat, alerts, or the network view.</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                   <Link to="/files" className="rounded-xl border border-[var(--border)] bg-[var(--card-hover)] p-3 hover:bg-[var(--card-hover)] transition-colors">
                     <div className="flex items-center gap-2 font-medium text-sm"><Files size={15} className="text-[var(--accent)]" /> Files</div>
                     <div className="text-xs text-[var(--muted)] mt-1">Browse the shared folder tree, upload, versions, per-file comments</div>
@@ -139,22 +140,23 @@ export function Dashboard() {
 
               <Card>
                 <h2 className="text-[var(--accent)] font-semibold tracking-tight mb-3">Event Timeline</h2>
-                <p className="text-[var(--muted)] text-sm">
-                  {shown.length} of {events.length} events matching{" "}
-                  {query ? <span className="font-medium text-[var(--accent)]">${query}</span> : ''}
+                <p className="text-[var(--muted)] text-sm mb-3">
+                  {shown.length} of {events.length} events{query ? <> matching <span className="font-medium text-[var(--accent)]">“{query}”</span></> : ''}
                 </p>
 
-                <div className="space-y-2 max-h-[500px] overflow-auto">
+                <div className="space-y-2 max-h-[500px] overflow-auto pr-1">
                   {shown.map(e => (
-                    <div key={e.id} className="rounded-xl bg-[var(--card)] p-3 flex items-start gap-3 transition-colors hover:bg-[var(--card-hover)]">
-                      <div className="w-1 h-1/2 rounded-full" style={{ background: getPriorityColor(e.priority), marginTop: 4 }} />
-                      <div className="flex-1 min-w-0">
-                        <div className="font-medium line-clamp-1">{e.actor}</div>
-                        <div className="text-[var(--muted)] line-clamp-1 truncate">{e.resource}</div>
+                    <div key={e.id} className="rounded-xl bg-[var(--card)] p-3 flex items-stretch gap-3 transition-colors hover:bg-[var(--card-hover)]">
+                      <span className="w-1 rounded-full shrink-0" style={{ background: getPriorityColor(e.priority) }} />
+                      <div className="flex-1 min-w-0 py-0.5">
+                        <div className="flex items-baseline gap-2 flex-wrap">
+                          <span className="text-[11px] font-bold tracking-wider text-[var(--accent)]">{e.type}</span>
+                          <span className="text-xs text-[var(--muted)] ml-auto shrink-0">
+                            {new Date(e.timestamp).toLocaleTimeString()}
+                          </span>
+                        </div>
+                        <div className="font-medium text-sm truncate">{e.actor} <span className="font-normal text-[var(--muted)]">→ {e.resource || '—'}</span></div>
                       </div>
-                      <span className="text-[var(--muted)] text-xs">
-                        {new Date(e.timestamp).toLocaleTimeString()}
-                      </span>
                     </div>
                   ))}
                   {events.length === 0 && !query && (

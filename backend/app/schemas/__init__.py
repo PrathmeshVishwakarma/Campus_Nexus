@@ -55,6 +55,15 @@ class ChannelCreate(BaseModel):
     members: list[str] = []
 
 
+class ChannelRename(BaseModel):
+    name: str
+
+
+class ChannelMembersUpdate(BaseModel):
+    add: list[str] = []
+    remove: list[str] = []
+
+
 class AlertCreate(BaseModel):
     title: str
     body: str

@@ -75,8 +75,8 @@ export default function Alerts() {
   }
 
   return (
-    <div className="p-4 sm:p-6 max-w-5xl mx-auto grid md:grid-cols-2 gap-4">
-      <Card className="p-4">
+    <div className="mx-auto w-full max-w-5xl px-4 sm:px-6 py-6 grid md:grid-cols-2 gap-4 items-start">
+      <Card>
         <h2 className="text-lg font-bold flex items-center gap-2 mb-1"><Bell size={17} className="text-[var(--accent)]" /> Raise an alert</h2>
         <p className="text-xs text-[var(--muted)] mb-3">Broadcasts to every node. Delivery receipts are created per user; ask them to ACK.</p>
         <div className="space-y-2">
@@ -102,7 +102,7 @@ export default function Alerts() {
         </div>
       </Card>
 
-      <Card className="p-4">
+      <Card>
         <div className="flex items-center gap-2 mb-3 flex-wrap">
           <h2 className="text-lg font-bold">Alerts</h2>
           <select value={filter} onChange={e => setFilter(e.target.value)} className="rounded-lg border border-[var(--border)] bg-[var(--card)] px-2 py-1.5 text-sm" aria-label="Filter by priority">

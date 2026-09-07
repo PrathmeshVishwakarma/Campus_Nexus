@@ -234,8 +234,8 @@ export default function Network() {
             {stats.throttle?.paused ? 'Paused (anomaly)' : 'Running normally'}
           </p>
         </div>
-        <div className="p-3">
-          {stats.scheduler_queue.map((t: { label: string; priority: number }) => (
+      <div className="p-3 space-y-1.5">
+        {stats.scheduler_queue.map((t: { label: string; priority: number }) => (
             <div
               key={t.label}
               className="flex items-center gap-2 px-3 py-1.5 rounded text-xs"
@@ -267,8 +267,8 @@ export default function Network() {
           <h3 className="font-semibold">Network Stats</h3>
         </div>
         <div className="p-3">
-          <p className="text-sm">
-            <Clock className="mr-2 h-4 w-4" /> Total tx: {formatBytes(netIO.bytes_sent)}
+          <p className="text-sm flex items-center gap-2">
+            <Clock className="h-4 w-4 text-[var(--muted)]" /> Total tx: {formatBytes(netIO.bytes_sent)}
           </p>
 {throttle.congested && (
           <div className="flex flex-col gap-1">
@@ -297,37 +297,29 @@ export default function Network() {
   }
 
   return (
-    <div className="p-6 max-w-2xl mx-auto">
-      <div className="grid grid-cols-1 gap-6">
-        {/* Topology Graph */}
-        <div>
-          <div className="flex items-center gap-2 mb-3">
-            <Wifi size={16} />
-            <h2 className="font-semibold">Topology</h2>
-            <button
-              onClick={discover}
-              className="ml-auto rounded-md px-2.5 py-1.5 text-xs font-medium bg-[var(--accent)] text-white"
-              aria-label="Discover peers"
-            >
-              Discover
-            </button>
-          </div>
-
-          {graph ? renderGraph(graph) : (
-            <div className="p-6 text-[var(--muted)] text-center">
-              <Signal className="w-12 h-12 mx-auto mb-4 opacity-30" />
-              <p>No peers discovered yet</p>
-              <p className="mt-2">Click "Discover" to find nodes on the LAN</p>
-            </div>
-          )}
-        </div>
-
-        {/* Scheduler + Stats */}
-        <div>
-          {stats && renderScheduler(stats)}
-          {stats && renderNetStats(stats)}
-        </div>
+    <div className="mx-auto w-full max-w-2xl px-4 sm:px-6 py-6 space-y-4">
+      <div className="flex items-center gap-2">
+        <Wifi size={16} className="text-[var(--accent)]" />
+        <h1 className="text-xl font-bold tracking-tight">Network topology</h1>
+        <button
+          onClick={discover}
+          className="ml-auto rounded-lg px-3 py-1.5 text-xs font-medium bg-[var(--accent)] text-white hover:opacity-90 transition-opacity"
+          aria-label="Discover peers"
+        >
+          Discover
+        </button>
       </div>
+
+      {graph ? renderGraph(graph) : (
+        <div className="rounded-2xl border border-[var(--border)] bg-[var(--card)] p-8 text-[var(--muted)] text-center text-sm">
+          <Signal className="w-12 h-12 mx-auto mb-4 opacity-30" />
+          <p>No peers discovered yet</p>
+          <p className="mt-2 text-xs">Click "Discover" to find nodes on the LAN</p>
+        </div>
+      )}
+
+      {stats && renderScheduler(stats)}
+      {stats && renderNetStats(stats)}
     </div>
   )
 }

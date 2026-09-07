@@ -29,16 +29,16 @@ export function Login() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-[var(--bg)]">
+    <div className="min-h-screen flex items-center justify-center bg-[var(--bg)] px-4 py-8">
       <div
-        className="w-full max-w-md space-y-4 p-8 bg-[var(--card)] border border-[var(--border)] rounded-2xl"
+        className="w-full max-w-md space-y-5 p-6 sm:p-8 bg-[var(--card)] border border-[var(--border)] rounded-2xl shadow-[0_2px_12px_rgba(0,0,0,0.2)]"
         style={{ backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)' }}
       >
         <div className="text-center">
-          <h2 className="text-3xl font-extrabold tracking-tight mb-2">
-            Campus Nexus <span className="text-[var(--accent)]">login</span>
+          <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight mb-2">
+            Campus Nexus <span className="text-[var(--accent)]">Log in</span>
           </h2>
-          <p className="text-[var(--muted)]">Sign in to continue</p>
+          <p className="text-sm text-[var(--muted)]">Sign in to continue</p>
         </div>
 
         {error && (
@@ -47,7 +47,7 @@ export function Login() {
           </div>
         )}
 
-        <form onSubmit={handleLogin} className="mt-6 space-y-4">
+        <form onSubmit={handleLogin} className="space-y-4">
           <Input type="text" name="username" placeholder="Username" autoComplete="username" required />
           <Input type="password" name="password" placeholder="Password" autoComplete="current-password" required />
           <Button type="submit" disabled={loggingIn} className="w-full">
