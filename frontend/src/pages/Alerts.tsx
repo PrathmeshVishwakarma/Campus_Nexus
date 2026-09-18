@@ -12,18 +12,24 @@ type AlertItem = {
 }
 type Receipt = { user: string; delivered_at: string; acked_at: string | null; latency_ms: number }
 
-const PRIORITIES = ['CRITICAL', 'URGENT', 'IMPORTANT', 'NORMAL', 'INFO'] as const
+const PRIORITIES = ['ALL', 'CRITICAL', 'URGENT', 'IMPORTANT', 'NORMAL', 'INFO'] as const
+type PriorityFilter = typeof PRIORITIES[number]
 
 const dot: Record<string, string> = {
   CRITICAL: 'var(--error)', URGENT: 'var(--warning)', IMPORTANT: 'var(--accent)',
   NORMAL: 'var(--muted)', INFO: 'var(--muted)',
 }
 
+const tabColor: Record<string, string> = {
+  CRITICAL: 'rgba(239,68,68,0.15)', URGENT: 'rgba(245,158,11,0.15)',
+  IMPORTANT: 'rgba(139,92,246,0.15)', NORMAL: 'rgba(136,146,176,0.1)', INFO: 'rgba(136,146,176,0.1)',
+}
+
 export default function Alerts() {
   const { token } = useAuth()
   const [alerts, setAlerts] = useState<AlertItem[]>([])
   const [form, setForm] = useState({ title: '', body: '', priority: 'URGENT' })
-  const [filter, setFilter] = useState('')
+  const [filter, setFilter] = useState<PriorityFilter>('ALL')
   const [ranked, setRanked] = useState(false)
   const [receipts, setReceipts] = useState<Record<string, Receipt[]>>({})
 
@@ -31,7 +37,7 @@ export default function Alerts() {
 
   const load = async () => {
     try {
-      const res = filter
+      const res = filter !== 'ALL'
         ? await api(`/api/alerts?priority=${filter}`, auth)
         : await api('/api/alerts', auth)
       setAlerts(res)
@@ -41,6 +47,14 @@ export default function Alerts() {
 
   useEffect(() => { load() }, [])
   useEffect(() => { load() }, [filter])
+
+  // Auto-load receipts for CRITICAL alerts
+  useEffect(() => {
+    const criticals = alerts.filter(a => a.priority === 'CRITICAL')
+    criticals.forEach(a => {
+      if (!receipts[a.id]) showReceipts(a.id)
+    })
+  }, [alerts])
 
   const create = async () => {
     if (!form.title.trim()) return toast.error('Title required')
@@ -74,6 +88,24 @@ export default function Alerts() {
     } catch (e: any) { toast.error(e.message) }
   }
 
+  // Initials avatar for a username
+  function Avatar({ name, acked }: { name: string; acked: boolean }) {
+    const initials = name.slice(0, 2).toUpperCase()
+    return (
+      <span
+        title={`${name}${acked ? ' ✓ acked' : ' — pending'}`}
+        className="inline-flex items-center justify-center w-6 h-6 rounded-full text-[10px] font-bold border-2"
+        style={{
+          background: acked ? 'rgba(16,185,129,0.2)' : 'rgba(136,146,176,0.15)',
+          borderColor: acked ? 'var(--success)' : 'var(--border)',
+          color: acked ? 'var(--success)' : 'var(--muted)',
+        }}
+      >
+        {initials}
+      </span>
+    )
+  }
+
   return (
     <div className="mx-auto w-full max-w-5xl px-4 sm:px-6 py-6 grid md:grid-cols-2 gap-4 items-start">
       <Card>
@@ -87,8 +119,9 @@ export default function Alerts() {
             className="w-full bg-[var(--card)] border border-[var(--border)] rounded-lg px-3 py-2 outline-none text-sm text-[var(--fg)] placeholder-[var(--muted)] focus:ring-2 focus:ring-[var(--accent)] resize-none"
             aria-label="Alert body"
           />
+          {/* Priority selector buttons (reused in form) */}
           <div className="flex flex-wrap gap-1.5">
-            {PRIORITIES.map(p => (
+            {(['CRITICAL', 'URGENT', 'IMPORTANT', 'NORMAL', 'INFO'] as const).map(p => (
               <button
                 key={p}
                 onClick={() => setForm({ ...form, priority: p })}
@@ -103,14 +136,24 @@ export default function Alerts() {
       </Card>
 
       <Card>
-        <div className="flex items-center gap-2 mb-3 flex-wrap">
-          <h2 className="text-lg font-bold">Alerts</h2>
-          <select value={filter} onChange={e => setFilter(e.target.value)} className="rounded-lg border border-[var(--border)] bg-[var(--card)] px-2 py-1.5 text-sm" aria-label="Filter by priority">
-            <option value="">All priorities</option>
-            {PRIORITIES.map(p => <option key={p} value={p}>{p}</option>)}
-          </select>
-          <Button variant="secondary" onClick={loadRanked}>Smart rank</Button>
-          <Button variant="secondary" onClick={load}>Refresh</Button>
+        {/* Priority tab bar */}
+        <div className="flex items-center gap-1 mb-3 flex-wrap">
+          {PRIORITIES.map(p => (
+            <button
+              key={p}
+              onClick={() => setFilter(p)}
+              className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition-all border ${
+                filter === p
+                  ? 'border-[var(--accent)] text-[var(--accent)] bg-[rgba(139,92,246,0.15)]'
+                  : 'border-[var(--border)] text-[var(--muted)] hover:text-[var(--fg)]'
+              }`}
+              style={filter === p && p !== 'ALL' ? { background: tabColor[p] } : {}}
+            >
+              {p}
+            </button>
+          ))}
+          <Button variant="secondary" onClick={loadRanked} className="ml-auto text-xs">Smart rank</Button>
+          <Button variant="secondary" onClick={load} className="text-xs">↺</Button>
         </div>
         {ranked && <p className="text-xs text-[var(--muted)] mb-2">Sorted by smart rank (priority × sender affinity × recency).</p>}
 
@@ -118,14 +161,32 @@ export default function Alerts() {
           {alerts.map(a => (
             <div key={a.id} className="rounded-xl border border-[var(--border)] bg-[var(--card)] p-3">
               <div className="flex items-start gap-2">
-                <span className="mt-1.5 w-2 h-2 rounded-full shrink-0" style={{ background: dot[a.priority] ?? 'var(--muted)' }} />
+                {/* Priority dot — CRITICAL pulses */}
+                <span
+                  className={`mt-1.5 w-2.5 h-2.5 rounded-full shrink-0 ${a.priority === 'CRITICAL' ? 'animate-pulse' : ''}`}
+                  style={{ background: dot[a.priority] ?? 'var(--muted)',
+                    boxShadow: a.priority === 'CRITICAL' ? '0 0 6px var(--error)' : undefined }}
+                />
                 <div className="min-w-0 flex-1">
                   <div className="font-medium text-sm truncate">{a.title}</div>
                   <div className="text-xs text-[var(--muted)]">{a.body}</div>
                   <div className="text-[11px] text-[var(--muted)] mt-1">
-                    {a.priority} · by {a.sender} · {new Date(a.created_at).toLocaleString()} · {a.acked}/{a.total} acked
+                    <span
+                      className="font-semibold mr-1 px-1.5 py-0.5 rounded"
+                      style={{ background: tabColor[a.priority] ?? 'transparent', color: dot[a.priority] }}
+                    >{a.priority}</span>
+                    by {a.sender} · {new Date(a.created_at).toLocaleString()} · {a.acked}/{a.total} acked
                     {typeof a.score === 'number' && <span> · score {a.score}</span>}
                   </div>
+
+                  {/* ACK avatar strip */}
+                  {receipts[a.id] && receipts[a.id].length > 0 && (
+                    <div className="flex gap-1 mt-1.5 flex-wrap">
+                      {receipts[a.id].map(r => (
+                        <Avatar key={r.user} name={r.user} acked={!!r.acked_at} />
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
               <div className="flex gap-2 mt-2 flex-wrap">

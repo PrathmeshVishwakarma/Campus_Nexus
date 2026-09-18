@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ChevronDown, ChevronRight, Download, Folder, FolderOpen, MessageSquare, RefreshCw, Upload, History, ShieldCheck } from 'lucide-react'
+import { useDropzone } from 'react-dropzone'
+import { ChevronDown, ChevronRight, Download, Folder, FolderOpen, MessageSquare, RefreshCw, Upload, History, ShieldCheck, ToggleLeft, ToggleRight } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, useAuth } from '../store/useAuth'
 import { Card } from '../components/ui/card'
@@ -11,12 +12,20 @@ type FileItem = { name: string; path: string; size: number; version: number; has
 type Version = { version: number; hash: string; size: number; by: string; at: string; chunks: unknown; clock: Record<string, number> }
 type ThreadMsg = { id: number; sender: string; content: string; file_link: string; read: boolean; created_at: string }
 type Channel = { id: number; name: string; type: string; members: string[] }
+type SharedFolder = { id: number; name: string; path: string; sync_enabled: boolean }
 
 const CHUNK = 1024 * 1024
 
 function dirOf(path: string) {
   const i = path.lastIndexOf('/')
   return i < 0 ? '' : path.slice(0, i)
+}
+
+/** Compute SHA-256 of a Blob using the Web Crypto API. */
+async function sha256Blob(blob: Blob): Promise<string> {
+  const buf = await blob.arrayBuffer()
+  const digest = await crypto.subtle.digest('SHA-256', buf)
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
 export default function Files() {
@@ -27,8 +36,9 @@ export default function Files() {
   const [versions, setVersions] = useState<Version[]>([])
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   const [share, setShare] = useState({ name: '', path: '' })
-  const [uploading, setUploading] = useState(false)
+  const [progress, setProgress] = useState<number | null>(null)  // null=idle, 0-100=uploading
   const [uploadDir, setUploadDir] = useState('')
+  const [folders, setFolders] = useState<SharedFolder[]>([])
   // per-file comments
   const [channels, setChannels] = useState<Channel[]>([])
   const [threadChannel, setThreadChannel] = useState<number | null>(null)
@@ -44,6 +54,13 @@ export default function Files() {
     } catch (e: any) {
       toast.error(e.message)
     }
+  }
+
+  const loadFolders = async () => {
+    try {
+      const res = await api('/api/files/folders', auth)
+      setFolders(res)
+    } catch { /* optional */ }
   }
 
   const loadChannels = async () => {
@@ -73,7 +90,7 @@ export default function Files() {
     }
   }
 
-  useEffect(() => { load(); loadChannels() }, [])
+  useEffect(() => { load(); loadChannels(); loadFolders() }, [])
   useEffect(() => {
     if (selected) { loadVersions(selected); loadThread(selected, threadChannel) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -106,16 +123,47 @@ export default function Files() {
       toast.success(`Shared folder "${share.name}"`)
       setShare({ name: '', path: '' })
       load()
+      loadFolders()
+    } catch (e: any) { toast.error(e.message) }
+  }
+
+  const toggleFolderSync = async (folder: SharedFolder) => {
+    try {
+      const res = await api(`/api/files/folders/${folder.id}/sync-toggle`, { ...auth, method: 'PATCH' })
+      toast.success(`Sync ${res.sync_enabled ? 'enabled' : 'disabled'} for "${folder.name}"`)
+      loadFolders()
     } catch (e: any) { toast.error(e.message) }
   }
 
   const uploadFile = async (file: File) => {
     const rel = (uploadDir ? uploadDir.replace(/\/+$/, '') + '/' : '') + file.name
-    setUploading(true)
+    setProgress(0)
     try {
       const total = Math.max(1, Math.ceil(file.size / CHUNK))
+
+      // Delta sync: fetch manifest to discover which chunks already exist on server
+      let existingChunkHashes: string[] = []
+      try {
+        const manifest = await api(`/api/sync/manifest?path=${encodeURIComponent(rel)}`, auth)
+        if (manifest.exists && Array.isArray(manifest.chunks)) {
+          existingChunkHashes = manifest.chunks.map((c: any) => c.hash as string)
+        }
+      } catch { /* manifest optional — fall back to full upload */ }
+
+      let skipped = 0
       for (let i = 0; i < total; i++) {
         const piece = file.slice(i * CHUNK, (i + 1) * CHUNK)
+
+        // Compare local chunk hash with server manifest to skip unchanged chunks
+        if (existingChunkHashes[i]) {
+          const localHash = await sha256Blob(piece)
+          if (localHash === existingChunkHashes[i]) {
+            skipped++
+            setProgress(Math.round(((i + 1) / total) * 100))
+            continue
+          }
+        }
+
         const form = new FormData()
         form.append('file', piece, file.name)
         const res = await fetch(`/api/sync/chunk?path=${encodeURIComponent(rel)}&index=${i}&total=${total}`, {
@@ -124,17 +172,32 @@ export default function Files() {
           body: form,
         })
         if (!res.ok) throw new Error(await res.text())
+        setProgress(Math.round(((i + 1) / total) * 100))
       }
+
       const done = await api(`/api/sync/complete?path=${encodeURIComponent(rel)}`, { ...auth, method: 'POST', body: JSON.stringify({}) })
-      toast.success(done?.deduped ? `No changes (deduped), still v${done.version}` : `Uploaded ${rel} → v${done.version}`)
+      const skipMsg = skipped > 0 ? ` (${skipped}/${total} chunks skipped — delta sync)` : ''
+      toast.success(done?.deduped ? `No changes (deduped), still v${done.version}` : `Uploaded ${rel} → v${done.version}${skipMsg}`)
       load()
       setSelected(rel)
     } catch (e: any) {
       toast.error(e.message)
     } finally {
-      setUploading(false)
+      setProgress(null)
     }
   }
+
+  // react-dropzone integration
+  const onDrop = useCallback((accepted: File[]) => {
+    if (accepted[0]) uploadFile(accepted[0])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uploadDir, token])
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    multiple: false,
+    disabled: progress !== null,
+  })
 
   const downloadFile = async (path: string) => {
     try {
@@ -191,13 +254,70 @@ export default function Files() {
           </div>
         </div>
 
+        {/* Selective-sync toggles */}
+        {folders.length > 0 && (
+          <div className="rounded-xl border border-[var(--border)] p-3 mb-3">
+            <div className="text-sm font-medium mb-2">Selective sync</div>
+            <div className="space-y-1.5">
+              {folders.map(f => (
+                <div key={f.id} className="flex items-center justify-between text-xs">
+                  <span className="truncate text-[var(--fg)]">{f.name}</span>
+                  <button
+                    onClick={() => toggleFolderSync(f)}
+                    className="flex items-center gap-1 ml-2 shrink-0"
+                    title={f.sync_enabled ? 'Sync ON — click to disable' : 'Sync OFF — click to enable'}
+                    aria-label={`Toggle sync for ${f.name}`}
+                  >
+                    {f.sync_enabled
+                      ? <ToggleRight size={18} className="text-[var(--success)]" />
+                      : <ToggleLeft size={18} className="text-[var(--muted)]" />}
+                    <span style={{ color: f.sync_enabled ? 'var(--success)' : 'var(--muted)' }}>
+                      {f.sync_enabled ? 'ON' : 'OFF'}
+                    </span>
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="rounded-xl border border-[var(--border)] p-3 mb-3">
           <div className="text-sm font-medium mb-2 flex items-center gap-1.5"><Upload size={14} /> Upload a file</div>
           <Input value={uploadDir} onChange={e => setUploadDir(e.target.value)} placeholder="Destination folder (optional, e.g. thesis/)" aria-label="Destination folder" />
-          <label className="mt-2 block text-sm rounded-xl border border-dashed border-[var(--border)] p-3 text-center cursor-pointer hover:border-[var(--accent)] transition-colors">
-            {uploading ? 'Uploading…' : 'Choose file (1 MB chunked upload)'}
-            <input type="file" className="hidden" disabled={uploading} onChange={e => { const f = e.target.files?.[0]; if (f) uploadFile(f); e.target.value = '' }} />
-          </label>
+
+          {/* Drag-and-drop zone */}
+          <div
+            {...getRootProps()}
+            className={`mt-2 rounded-xl border-2 border-dashed p-4 text-center cursor-pointer transition-colors text-sm
+              ${isDragActive
+                ? 'border-[var(--accent)] bg-[rgba(139,92,246,0.08)] text-[var(--accent)]'
+                : 'border-[var(--border)] hover:border-[var(--accent)] text-[var(--muted)]'
+              }
+              ${progress !== null ? 'opacity-50 pointer-events-none' : ''}`}
+          >
+            <input {...getInputProps()} />
+            {isDragActive
+              ? '📂 Drop to upload…'
+              : progress !== null
+                ? `Uploading… ${progress}%`
+                : 'Drag & drop a file here, or click to choose (1 MB chunks)'}
+          </div>
+
+          {/* Progress bar */}
+          {progress !== null && (
+            <div className="mt-2">
+              <div className="flex justify-between text-xs text-[var(--muted)] mb-1">
+                <span>Uploading…</span>
+                <span>{progress}%</span>
+              </div>
+              <div className="w-full h-2 rounded-full bg-[var(--card-hover)] overflow-hidden">
+                <div
+                  className="h-full rounded-full transition-all duration-200"
+                  style={{ width: `${progress}%`, background: 'var(--accent)' }}
+                />
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="space-y-2 max-h-[420px] overflow-auto pr-1">

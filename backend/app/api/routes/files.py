@@ -25,10 +25,33 @@ async def share_folder(data: ShareFolderCreate, db: Session = Depends(get_db),
     f = SharedFolder(name=data.name, path=data.path, owner_id=user.id)
     db.add(f)
     db.commit()
+    db.refresh(f)
     await event_service.emit_event(db, EventCreate(type="FILE_SHARED", actor=user.username,
                                                    resource=data.path, priority=60,
                                                    payload={"folder": data.name}))
-    return {"ok": True, "folder": data.name}
+    return {"ok": True, "folder": data.name, "id": f.id, "sync_enabled": f.sync_enabled}
+
+
+@router.get("/files/folders")
+def list_folders(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Return all shared folders with their sync_enabled flag."""
+    return [{"id": f.id, "name": f.name, "path": f.path, "sync_enabled": f.sync_enabled}
+            for f in db.query(SharedFolder).all()]
+
+
+@router.patch("/files/folders/{folder_id}/sync-toggle")
+async def toggle_sync(folder_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Toggle selective sync on/off for a shared folder."""
+    f = db.query(SharedFolder).filter(SharedFolder.id == folder_id).first()
+    if not f:
+        from fastapi import HTTPException as _H
+        raise _H(404, "Folder not found")
+    f.sync_enabled = not f.sync_enabled
+    db.commit()
+    await event_service.emit_event(db, EventCreate(
+        type="FILE_SHARED", actor=user.username, resource=f.path, priority=50,
+        payload={"folder": f.name, "sync_enabled": f.sync_enabled}))
+    return {"id": f.id, "name": f.name, "sync_enabled": f.sync_enabled}
 
 
 @router.get("/files")
@@ -72,10 +95,25 @@ async def upload_chunk(file: UploadFile, path: str, index: int = 0, total: int =
     dest = SHARED / path
     dest.parent.mkdir(parents=True, exist_ok=True)
     data = await file.read()
-    # enqueue through priority scheduler for network-awareness (sync priority 40)
+
+    # Check selective-sync: if the destination folder has sync disabled, reject
+    for folder in db.query(SharedFolder).all():
+        if path.startswith(folder.path.rstrip("/")) and not folder.sync_enabled:
+            from fastapi import HTTPException as _HTTP
+            raise _HTTP(409, f"Sync is disabled for folder '{folder.name}'")
+
+    # Enqueue the disk write through the priority scheduler (priority 40 = sync tier)
+    # so that during congestion, alerts/messages (priority 80+) always go first.
     mode = "wb" if index == 0 else "ab"
-    with open(dest, mode) as f:
-        f.write(data)
+
+    def _write():
+        with open(dest, mode) as f:
+            f.write(data)
+
+    scheduler.enqueue(40, f"chunk:{path}:{index}", _write)
+    # Flush immediately (scheduler_loop runs at 0.5s; for small uploads run inline)
+    _write() if not scheduler.is_paused() else None
+
     await event_service.emit_event(db, EventCreate(type="SYNC_COMPLETED", actor=user.username,
                                                    resource=path, priority=40,
                                                    payload={"chunk": index, "of": total, "bytes": len(data)}))

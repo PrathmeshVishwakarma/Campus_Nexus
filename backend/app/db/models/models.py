@@ -29,6 +29,7 @@ class SharedFolder(Base):
     name: Mapped[str] = mapped_column(String(128))
     path: Mapped[str] = mapped_column(String(512))
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    sync_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

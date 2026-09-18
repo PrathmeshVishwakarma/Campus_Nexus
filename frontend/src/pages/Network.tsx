@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react'
-import { Wifi, Signal, MapPin, Clock, RefreshCw } from 'lucide-react'
+import React, { useEffect, useState, useRef } from 'react'
+import { Wifi, Signal, Clock } from 'lucide-react'
 import { toast } from 'sonner'
+import * as d3 from 'd3'
 import { api, useAuth } from '../store/useAuth'
 
 type Node = { id: string; ip: string; latency: number; status: string; last_seen: string }
@@ -16,20 +17,20 @@ type GraphData = {
 type Stats = {
   scheduler_queue: { label: string; priority: number }[]
   throttle: { congested: boolean; bps: number; paused: boolean } | null
-  net_io: { bytes_sent: number }
+  net_io: { bytes_sent: number; dropin?: number; dropout?: number }
 }
 
 export default function Network() {
-  const { user, token } = useAuth()
+  const { token } = useAuth()
   const [graph, setGraph] = useState<GraphData | null>(null)
   const [stats, setStats] = useState<Stats | null>(null)
 
   const load = async () => {
     try {
       const [g, s] = await Promise.all([
-      api('/api/network/graph', { headers: { Authorization: `Bearer ${token}` } }),
-      api('/api/network/stats', { headers: { Authorization: `Bearer ${token}` } })
-    ])
+        api('/api/network/graph', { headers: { Authorization: `Bearer ${token}` } }),
+        api('/api/network/stats', { headers: { Authorization: `Bearer ${token}` } })
+      ])
       setGraph(g as GraphData)
       setStats(s as Stats)
     } catch (e: any) {
@@ -39,12 +40,8 @@ export default function Network() {
 
   useEffect(() => {
     load()
-    const refresh = () => {
-      load()
-      setTimeout(refresh, 8000)
-    }
-    refresh()
-    return () => {}
+    const interval = setInterval(load, 8000)
+    return () => clearInterval(interval)
   }, [])
 
   const discover = async () => {
@@ -60,20 +57,6 @@ export default function Network() {
     }
   }
 
-  function getPriorityClass(priority: number) {
-    if (priority >= 80) return 'critical'
-    if (priority >= 60) return 'urgent'
-    if (priority >= 40) return 'normal'
-    return 'low'
-  }
-
-  function formatBytes(bytes: number) {
-    if (bytes >= 1_000_000_000) return `(${(bytes / 1_000_000_000).toFixed(2)} GB)`
-    if (bytes >= 1_000_000) return `(${(bytes / 1_000_000).toFixed(2)} MB)`
-    if (bytes >= 1_000) return `(${(bytes / 1_000).toFixed(2)} KB)`
-    return ''
-  }
-
   function getPriorityColor(priority: number) {
     if (priority >= 80) return 'var(--error)'
     if (priority >= 60) return 'var(--accent)'
@@ -81,245 +64,205 @@ export default function Network() {
     return 'var(--muted)'
   }
 
-  function getPriorityBg(priority: number) {
-    if (priority >= 80) return 'red'
-    if (priority >= 60) return 'amber'
-    if (priority >= 40) return 'violet'
-    return 'gray'
-  }
-
-  function renderGraph(graphData: GraphData) {
-    const { nodes, edges, isolated, central, online, total } = graphData
-
-    // Calculate positions using a simple force layout approximation
-    const nodeMap = new Map<string, { x: number; y: number }>()
-    const serverNode = nodes.find(n => n.id === 'server')
-
-    // Position server in center
-    if (serverNode) {
-      nodeMap.set('server', { x: 500, y: 300 })
-    }
-
-    // Position other nodes around
-    nodes.forEach((node, i) => {
-      if (node.id !== 'server') {
-        const angle = (i * 360) / Math.max(nodes.length, 1)
-        const radius = 200
-        nodeMap.set(node.id, {
-          x: 500 + radius * Math.cos(angle * Math.PI / 180),
-          y: 300 + radius * Math.sin(angle * Math.PI / 180),
-        })
-      }
-    })
-
-    // Default positions if server not found
-    if (!serverNode) {
-      nodes.forEach((node, i) => {
-        const angle = (i * 360) / Math.max(nodes.length, 1)
-        const radius = 200
-        nodeMap.set(node.id, {
-          x: 500 + radius * Math.cos(angle * Math.PI / 180),
-          y: 300 + radius * Math.sin(angle * Math.PI / 180),
-        })
-      })
-    }
-
-    return (
-      <div className="rounded-2xl overflow-hidden bg-[var(--card)] border border-[var(--border)]">
-        <svg className="w-full h-64" viewBox="0 0 1000 600">
-          {/* Edges */}
-          {edges.map((e: Edge) => {
-            const from = nodeMap.get(e.from)
-            const to = nodeMap.get(e.to)
-            if (!from || !to) return null
-            return (
-              <line
-                key={`edge-${e.from}-${e.to}`}
-                x1={from.x}
-                y1={from.y}
-                x2={to.x}
-                y2={to.y}
-                stroke="var(--border)"
-                strokeWidth={2}
-                strokeOpacity={0.3}
-              />
-            )
-          })}
-
-          {/* Nodes */}
-          {nodes.map((n: Node) => {
-            const pos = nodeMap.get(n.id)
-            if (!pos) return null
-
-            const isIsolated = isolated.includes(n.id)
-            const isCentral = n.id === central
-            const cls = `node ${isIsolated ? 'isolated' : ''} ${isCentral ? 'central' : ''} ${getPriorityClass(n.latency)}`
-
-            return (
-              <g key={`node-${n.id}`}>
-                <circle
-                  cx={pos.x}
-                  cy={pos.y}
-                  r={isIsolated ? 8 : isCentral ? 14 : 10}
-                  fill={isIsolated ? 'var(--error)' : isCentral ? 'var(--accent)' : 'var(--card-hover)'}
-                  stroke={isIsolated ? 'var(--bg)' : isCentral ? 'var(--bg)' : 'var(--border)'}
-                  strokeWidth={2}
-                />
-                <text
-                  x={pos.x}
-                  y={pos.y + 5}
-                  textAnchor="middle"
-                  fontSize={10}
-                  fill={n.id === central ? 'white' : isIsolated ? 'var(--bg)' : 'var(--muted)'}
-                  fontWeight={n.id === central ? 'bold' : 'normal'}
-                >
-                  {n.id.substring(0, 8)}
-                </text>
-              </g>
-            )
-          })}
-
-          {/* Labels for non-server nodes */}
-          {nodes
-            .filter((n) => n.id !== 'server')
-            .map((n: Node) => {
-              const pos = nodeMap.get(n.id)
-              if (!pos) return null
-              return (
-                <text
-                  key={`label-${n.id}`}
-                  x={pos.x}
-                  y={pos.y - 15}
-                  textAnchor="middle"
-                  fontSize={9}
-                  fill={"var(--muted)"}
-                >
-                  {n.id.substring(0, 5)}
-                </text>
-              )
-            })}
-        </svg>
-
-        <div className="p-4 bg-[var(--card)]">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-medium">Nodes</span>
-            <span className="text-[var(--muted)] text-xs">{online}/{total}</span>
-          </div>
-          <div className="flex gap-2">
-            {nodes.map((n: Node) => (
-              <div
-                key={n.id}
-                className="flex items-center gap-2 px-2 py-1 rounded text-xs"
-                style={{
-                  background: n.status === 'online' ? 'rgba(16,185,129,0.15)' : 'rgba(239,68,68,0.15)',
-                  color: n.status === 'online' ? 'var(--success)' : 'var(--error)',
-                }}
-              >
-                <span className="w-2 h-2 rounded-full" style={{ background: n.status === 'online' ? 'var(--success)' : 'var(--error)' }}/>
-                {n.id}
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  function renderScheduler(stats: Stats) {
-    return (
-      <div className="rounded-2xl overflow-hidden bg-[var(--card)] border border-[var(--border)]">
-        <div className="p-3 border-b border-[var(--border)]">
-          <h3 className="font-semibold">Scheduler Queue</h3>
-          <p className="text-xs text-[var(--muted)]">
-            {stats.throttle?.paused ? 'Paused (anomaly)' : 'Running normally'}
-          </p>
-        </div>
-      <div className="p-3 space-y-1.5">
-        {stats.scheduler_queue.map((t: { label: string; priority: number }) => (
-            <div
-              key={t.label}
-              className="flex items-center gap-2 px-3 py-1.5 rounded text-xs"
-              style={{ background: getPriorityBg(t.priority), color: 'white' }}
-            >
-              <div className="w-6 h-6 rounded-md" style={{ background: getPriorityColor(t.priority) }}/>
-              <span>{t.label}: P{t.priority}</span>
-            </div>
-          ))}
-          {stats.scheduler_queue.length === 0 && (
-            <span className="text-[var(--muted)]">Empty</span>
-          )}
-        </div>
-      </div>
-    )
-  }
-
-  function renderNetStats(stats: Stats) {
-    const throttle: { congested: boolean; bps: number; paused: boolean } = stats.throttle || {
-      congested: false,
-      bps: 0,
-      paused: false,
-    }
-    const netIO = stats.net_io || { bytes_sent: 0 }
-
-    return (
-      <div className="rounded-2xl overflow-hidden bg-[var(--card)] border border-[var(--border)]">
-        <div className="p-3 border-b border-[var(--border)]">
-          <h3 className="font-semibold">Network Stats</h3>
-        </div>
-        <div className="p-3">
-          <p className="text-sm flex items-center gap-2">
-            <Clock className="h-4 w-4 text-[var(--muted)]" /> Total tx: {formatBytes(netIO.bytes_sent)}
-          </p>
-{throttle.congested && (
-          <div className="flex flex-col gap-1">
-            <p className="mt-2 text-[var(--error)] font-medium">
-              Throttle: Congested
-            </p>
-            <p className="text-xs text-[var(--muted)]">Bandwidth: {throttle.bps.toLocaleString()} bps</p>
-          </div>
-        )}
-        {!throttle.congested && (
-          <div className="flex flex-col gap-1">
-            <p className="mt-2 text-[var(--emerald)]">
-              Throttle: Clear
-            </p>
-            <p className="text-xs text-[var(--muted)]">Bandwidth: {throttle.bps.toLocaleString()} bps</p>
-          </div>
-        )}
-        {throttle.paused && (
-          <p className="mt-2 text-[var(--error)] font-medium">
-            Paused (anomaly detected)
-          </p>
-        )}
-        </div>
-      </div>
-    )
+  function formatBytes(bytes: number) {
+    if (bytes >= 1_000_000_000) return `${(bytes / 1_000_000_000).toFixed(2)} GB`
+    if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(2)} MB`
+    if (bytes >= 1_000) return `${(bytes / 1_000).toFixed(2)} KB`
+    return `${bytes} B`
   }
 
   return (
-    <div className="mx-auto w-full max-w-2xl px-4 sm:px-6 py-6 space-y-4">
+    <div className="mx-auto w-full max-w-4xl px-4 sm:px-6 py-6 space-y-4">
       <div className="flex items-center gap-2">
         <Wifi size={16} className="text-[var(--accent)]" />
         <h1 className="text-xl font-bold tracking-tight">Network topology</h1>
         <button
           onClick={discover}
           className="ml-auto rounded-lg px-3 py-1.5 text-xs font-medium bg-[var(--accent)] text-white hover:opacity-90 transition-opacity"
-          aria-label="Discover peers"
         >
           Discover
         </button>
       </div>
 
-      {graph ? renderGraph(graph) : (
-        <div className="rounded-2xl border border-[var(--border)] bg-[var(--card)] p-8 text-[var(--muted)] text-center text-sm">
-          <Signal className="w-12 h-12 mx-auto mb-4 opacity-30" />
-          <p>No peers discovered yet</p>
-          <p className="mt-2 text-xs">Click "Discover" to find nodes on the LAN</p>
+      <div className="grid md:grid-cols-2 gap-4">
+        {/* D3 Graph */}
+        <div className="rounded-2xl border border-[var(--border)] bg-[var(--card)] overflow-hidden">
+          {graph ? <ForceGraph graph={graph} /> : (
+            <div className="p-8 text-[var(--muted)] text-center text-sm">
+              <Signal className="w-12 h-12 mx-auto mb-4 opacity-30" />
+              <p>No peers discovered yet</p>
+              <p className="mt-2 text-xs">Click "Discover" to find nodes on the LAN</p>
+            </div>
+          )}
         </div>
-      )}
 
-      {stats && renderScheduler(stats)}
-      {stats && renderNetStats(stats)}
+        {/* Health Bars & Stats */}
+        <div className="space-y-4">
+          <div className="rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4">
+            <h3 className="font-semibold mb-3">Network Health</h3>
+            
+            {/* Bandwidth Bar */}
+            <div className="mb-4">
+              <div className="flex justify-between text-xs text-[var(--muted)] mb-1">
+                <span>Bandwidth (5 MB/s limit)</span>
+                <span>{stats?.throttle ? formatBytes(stats.throttle.bps) + '/s' : '0 B/s'}</span>
+              </div>
+              <div className="w-full h-2 rounded-full bg-[var(--card-hover)] overflow-hidden">
+                <div
+                  className="h-full rounded-full transition-all duration-500"
+                  style={{
+                    width: `${Math.min(100, ((stats?.throttle?.bps || 0) / 5_000_000) * 100)}%`,
+                    background: stats?.throttle?.congested ? 'var(--error)' : 'var(--accent)'
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Latency Bar */}
+            <div className="mb-4">
+              {(() => {
+                const latencies = graph?.nodes.filter(n => n.id !== 'server').map(n => n.latency) || []
+                const avgLatency = latencies.length ? latencies.reduce((a, b) => a + b, 0) / latencies.length : 0
+                const latColor = avgLatency < 50 ? 'var(--success)' : avgLatency < 200 ? 'var(--warning)' : 'var(--error)'
+                return (
+                  <>
+                    <div className="flex justify-between text-xs text-[var(--muted)] mb-1">
+                      <span>Avg Peer Latency</span>
+                      <span>{avgLatency ? `${avgLatency.toFixed(1)} ms` : '—'}</span>
+                    </div>
+                    <div className="w-full h-2 rounded-full bg-[var(--card-hover)] overflow-hidden">
+                      <div
+                        className="h-full rounded-full transition-all duration-500"
+                        style={{
+                          width: `${Math.min(100, (avgLatency / 300) * 100)}%`,
+                          background: latColor
+                        }}
+                      />
+                    </div>
+                  </>
+                )
+              })()}
+            </div>
+
+            {/* Packet Loss */}
+            {stats?.net_io && (
+              <div className="text-xs text-[var(--muted)] flex justify-between items-center bg-[var(--card-hover)] p-2 rounded-lg">
+                <span className="flex items-center gap-1.5"><Clock size={14} /> Total TX: {formatBytes(stats.net_io.bytes_sent)}</span>
+                <span title="Packet loss (dropped packets)">
+                  Loss: {stats.net_io.dropout || 0} out / {stats.net_io.dropin || 0} in
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Scheduler Queue */}
+          <div className="rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4 max-h-[300px] overflow-auto">
+            <div className="flex justify-between items-center mb-3">
+              <h3 className="font-semibold">Scheduler Queue</h3>
+              <span className={`text-xs ${stats?.throttle?.paused ? 'text-[var(--error)]' : 'text-[var(--success)]'}`}>
+                {stats?.throttle?.paused ? 'Paused (Anomaly)' : 'Running'}
+              </span>
+            </div>
+            <div className="space-y-1.5">
+              {stats?.scheduler_queue.map(t => (
+                <div
+                  key={t.label}
+                  className="flex justify-between items-center p-2 rounded bg-[var(--card-hover)] text-xs"
+                >
+                  <span className="truncate mr-2 font-medium">{t.label}</span>
+                  <span
+                    className="px-1.5 py-0.5 rounded text-white font-bold whitespace-nowrap"
+                    style={{ background: getPriorityColor(t.priority) }}
+                  >
+                    P{t.priority}
+                  </span>
+                </div>
+              ))}
+              {(!stats?.scheduler_queue || stats.scheduler_queue.length === 0) && (
+                <p className="text-xs text-[var(--muted)] text-center py-4">Queue empty</p>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   )
+}
+
+function ForceGraph({ graph }: { graph: GraphData }) {
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!containerRef.current) return
+    const container = containerRef.current
+    container.innerHTML = '' // Clear old
+
+    const width = container.clientWidth
+    const height = 300
+
+    const svg = d3.select(container)
+      .append('svg')
+      .attr('width', width)
+      .attr('height', height)
+      .attr('viewBox', [0, 0, width, height])
+
+    // Convert string references to object references for D3
+    const nodes = graph.nodes.map(d => ({ ...d })) as any[]
+    const links = graph.edges.map(d => ({ source: d.from, target: d.to, latency: d.latency })) as any[]
+
+    const simulation = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(links).id((d: any) => d.id).distance(80))
+      .force('charge', d3.forceManyBody().strength(-300))
+      .force('center', d3.forceCenter(width / 2, height / 2))
+
+    const link = svg.append('g')
+      .attr('stroke', 'var(--border)')
+      .attr('stroke-opacity', 0.6)
+      .selectAll('line')
+      .data(links)
+      .join('line')
+      .attr('stroke-width', d => Math.max(1, 4 - (d.latency / 50)))
+
+    const node = svg.append('g')
+      .attr('stroke', 'var(--bg)')
+      .attr('stroke-width', 2)
+      .selectAll('circle')
+      .data(nodes)
+      .join('circle')
+      .attr('r', d => d.id === graph.central ? 14 : graph.isolated.includes(d.id) ? 8 : 10)
+      .attr('fill', d => d.id === graph.central ? 'var(--accent)' : graph.isolated.includes(d.id) ? 'var(--error)' : 'var(--success)')
+
+    const label = svg.append('g')
+      .selectAll('text')
+      .data(nodes)
+      .join('text')
+      .text(d => d.id.substring(0, 8))
+      .attr('font-size', '10px')
+      .attr('fill', d => d.id === graph.central ? '#fff' : 'var(--muted)')
+      .attr('text-anchor', 'middle')
+      .attr('dy', d => d.id === graph.central ? 3 : 20)
+      .attr('font-weight', d => d.id === graph.central ? 'bold' : 'normal')
+
+    simulation.on('tick', () => {
+      link
+        .attr('x1', d => d.source.x)
+        .attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x)
+        .attr('y2', d => d.target.y)
+      
+      node
+        .attr('cx', d => d.x = Math.max(15, Math.min(width - 15, d.x)))
+        .attr('cy', d => d.y = Math.max(15, Math.min(height - 15, d.y)))
+        
+      label
+        .attr('x', d => d.x)
+        .attr('y', d => d.y)
+    })
+
+    return () => {
+      simulation.stop()
+    }
+  }, [graph])
+
+  return <div ref={containerRef} className="w-full h-[300px]" />
 }

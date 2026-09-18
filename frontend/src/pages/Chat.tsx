@@ -49,6 +49,10 @@ export default function Chat() {
   const [addPick, setAddPick] = useState<string[]>([])
   const [removeId, setRemoveId] = useState<number | null>(null)
   const [del, setDel] = useState<{ id: number; name: string; count: number } | null>(null)
+  // Typing indicator: map of username → timeout handle
+  const [typingUsers, setTypingUsers] = useState<Record<string, boolean>>({})
+  const typingTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
+  const sendTypingDebounce = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const auth = { headers: { Authorization: `Bearer ${token}` } }
 
@@ -108,6 +112,18 @@ export default function Chat() {
     const onEvent = (raw: string) => {
       try {
         const e = JSON.parse(raw)
+        if (e.event === 'TYPING') {
+          const chId = e.data?.payload?.channel_id
+          const actor: string = e.data?.actor || ''
+          if (chId === cidRef.current && actor !== user) {
+            setTypingUsers(prev => ({ ...prev, [actor]: true }))
+            clearTimeout(typingTimers.current[actor])
+            typingTimers.current[actor] = setTimeout(() => {
+              setTypingUsers(prev => { const n = { ...prev }; delete n[actor]; return n })
+            }, 3000)
+          }
+          return
+        }
         if (e.event !== 'MESSAGE_SENT') return
         const resource: string = e.data?.resource || ''
         const m = resource.match(/^channel:(\d+)/)
@@ -131,6 +147,14 @@ export default function Chat() {
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [msgs])
+
+  const sendTyping = () => {
+    if (!cid) return
+    if (sendTypingDebounce.current) clearTimeout(sendTypingDebounce.current)
+    sendTypingDebounce.current = setTimeout(() => {
+      api(`/api/messages/typing?channel_id=${cid}`, { ...auth, method: 'POST' }).catch(() => {})
+    }, 300)
+  }
 
   const send = async () => {
     if (!text.trim() || !cid) return
@@ -336,13 +360,42 @@ export default function Chat() {
                   <span className="font-medium">{m.sender}</span>
                   {m.file_link && <span className="ml-2 text-xs text-[var(--accent)]">📎 {m.file_link}</span>}
                   <div className="mt-0.5">{m.content}</div>
-                  <div className="text-[11px] text-[var(--muted)] mt-1">{new Date(m.created_at).toLocaleString()} {m.read ? '· read' : ''}</div>
+                  <div className="text-[11px] text-[var(--muted)] mt-1 flex items-center gap-1.5">
+                    {new Date(m.created_at).toLocaleString()}
+                    {/* ✓✓ delivery ticks */}
+                    {m.sender === user && (
+                      <span
+                        className="font-bold"
+                        style={{ color: m.read ? 'var(--accent)' : 'var(--muted)' }}
+                        title={m.read ? 'Read' : 'Delivered'}
+                      >
+                        {m.read ? '✓✓' : '✓'}
+                      </span>
+                    )}
+                  </div>
                 </div>
               ))}
               {msgs.length === 0 && <p className="text-xs text-[var(--muted)] text-center py-8">No messages{fileFilter ? ' in this file thread' : ''} — say hello.</p>}
             </div>
+            {/* Typing indicator */}
+            {Object.keys(typingUsers).length > 0 && (
+              <div className="text-xs text-[var(--muted)] mb-1 flex items-center gap-1.5 animate-pulse">
+                <span className="inline-flex gap-0.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--muted)] animate-bounce" style={{ animationDelay: '0ms' }} />
+                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--muted)] animate-bounce" style={{ animationDelay: '150ms' }} />
+                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--muted)] animate-bounce" style={{ animationDelay: '300ms' }} />
+                </span>
+                {Object.keys(typingUsers).join(', ')} {Object.keys(typingUsers).length === 1 ? 'is' : 'are'} typing…
+              </div>
+            )}
             <div className="flex gap-2">
-              <Input value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === 'Enter' && send()} placeholder={fileFilter ? `Reply in thread ${fileFilter}…` : 'Message…'} aria-label="Message input" />
+              <Input
+                value={text}
+                onChange={e => { setText(e.target.value); sendTyping() }}
+                onKeyDown={e => e.key === 'Enter' && send()}
+                placeholder={fileFilter ? `Reply in thread ${fileFilter}…` : 'Message…'}
+                aria-label="Message input"
+              />
               <Button onClick={send}><span className="flex items-center gap-1.5"><Send size={14} /> Send</span></Button>
             </div>
           </>
