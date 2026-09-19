@@ -8,6 +8,7 @@ import { Toaster } from 'sonner';
 import { useAuth } from './store/useAuth';
 import { Dashboard } from './pages/Dashboard';
 import Files from './pages/Files';
+import FileDiscussion from './pages/FileDiscussion';
 import Chat from './pages/Chat';
 import Alerts from './pages/Alerts';
 import Network from './pages/Network';
@@ -35,6 +36,6 @@ function PrivateRoute({ children }) {
     return token ? _jsx(_Fragment, { children: children }) : _jsx(Navigate, { to: "/login", replace: true });
 }
 function App() {
-    return (_jsxs(Shell, { children: [_jsx(ThemeLoader, {}), _jsxs(Routes, { children: [_jsx(Route, { path: "/login", element: _jsx(Login, {}) }), _jsx(Route, { path: "/register", element: _jsx(Register, {}) }), _jsx(Route, { path: "/", element: _jsx(PrivateRoute, { children: _jsx(Dashboard, {}) }) }), _jsx(Route, { path: "/files", element: _jsx(PrivateRoute, { children: _jsx(Files, {}) }) }), _jsx(Route, { path: "/chat", element: _jsx(PrivateRoute, { children: _jsx(Chat, {}) }) }), _jsx(Route, { path: "/alerts", element: _jsx(PrivateRoute, { children: _jsx(Alerts, {}) }) }), _jsx(Route, { path: "/network", element: _jsx(PrivateRoute, { children: _jsx(Network, {}) }) }), _jsx(Route, { path: "*", element: _jsx(Navigate, { to: "/", replace: true }) })] })] }));
+    return (_jsxs(Shell, { children: [_jsx(ThemeLoader, {}), _jsxs(Routes, { children: [_jsx(Route, { path: "/login", element: _jsx(Login, {}) }), _jsx(Route, { path: "/register", element: _jsx(Register, {}) }), _jsx(Route, { path: "/", element: _jsx(PrivateRoute, { children: _jsx(Dashboard, {}) }) }), _jsx(Route, { path: "/files", element: _jsx(PrivateRoute, { children: _jsx(Files, {}) }) }), _jsx(Route, { path: "/files/discussion", element: _jsx(PrivateRoute, { children: _jsx(FileDiscussion, {}) }) }), _jsx(Route, { path: "/chat", element: _jsx(PrivateRoute, { children: _jsx(Chat, {}) }) }), _jsx(Route, { path: "/alerts", element: _jsx(PrivateRoute, { children: _jsx(Alerts, {}) }) }), _jsx(Route, { path: "/network", element: _jsx(PrivateRoute, { children: _jsx(Network, {}) }) }), _jsx(Route, { path: "*", element: _jsx(Navigate, { to: "/", replace: true }) })] })] }));
 }
 ReactDOM.createRoot(document.getElementById('root')).render(_jsx(QueryClientProvider, { client: qc, children: _jsxs(BrowserRouter, { children: [_jsx(Toaster, { theme: "dark" }), _jsx(App, {})] }) }));

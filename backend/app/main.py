@@ -77,6 +77,18 @@ def _start_background():
     from app.services.peer_discovery import start_listener_thread
 
     SHARED = Path(__file__).resolve().parents[3] / "shared" / "demo_files"
+    try:
+        _db = SessionLocal()
+        try:
+            from app.db.models.models import RootConfig as _RC
+            _row = _db.query(_RC).filter(_RC.id == 1).first()
+            if _row and _row.path:
+                _p = Path(_row.path)
+                SHARED = _p if _p.is_absolute() else Path(__file__).resolve().parents[3] / _row.path
+        finally:
+            _db.close()
+    except Exception:
+        pass
     SHARED.mkdir(parents=True, exist_ok=True)
 
     def on_fs(etype: str, path: str):

@@ -44,7 +44,7 @@ def test_alerts_ranked_and_ack():
 
 def test_messages_read_and_graph():
     _, h = _user()
-    ch = client.post("/api/messages/channels", json={"name": "t", "type": "group"}, headers=h).json()
+    ch = client.post("/api/messages/channels", json={"name": f"ch_{uuid.uuid4().hex[:6]}", "type": "group"}, headers=h).json()
     m = client.post("/api/messages", json={"channel_id": ch["id"], "content": "hi"}, headers=h).json()
     assert client.patch(f"/api/messages/{m['id']}/read", headers=h).json()["ok"] is True
     assert client.post("/api/peers/heartbeat", json={"hostname": "testnode", "ip": "127.0.0.1"}).json()["ok"] is True

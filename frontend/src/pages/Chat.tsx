@@ -53,6 +53,13 @@ export default function Chat() {
   const [typingUsers, setTypingUsers] = useState<Record<string, boolean>>({})
   const typingTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
   const sendTypingDebounce = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const msgListRef = useRef<HTMLDivElement | null>(null)
+  const msgEndRef = useRef<HTMLDivElement | null>(null)
+
+  // Always show the latest message: scroll to bottom on new messages / channel switch
+  useEffect(() => {
+    msgEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [msgs, cid])
 
   const auth = { headers: { Authorization: `Bearer ${token}` } }
 
@@ -398,7 +405,7 @@ export default function Chat() {
                 <span className="ml-auto text-xs text-[var(--muted)]">Tip: open a file in Files → “Open in Chat” to discuss it here.</span>
               )}
             </div>
-            <div className="flex-1 space-y-2 overflow-auto mb-3 max-h-[380px]">
+            <div ref={msgListRef} className="flex-1 space-y-2 overflow-auto mb-3 max-h-[380px]">
               {msgs.map(m => (
                 <div key={m.id} className="rounded-xl bg-[var(--card)] p-3 text-sm">
                   <span className="font-medium">{m.sender}</span>
@@ -420,6 +427,7 @@ export default function Chat() {
                 </div>
               ))}
               {msgs.length === 0 && <p className="text-xs text-[var(--muted)] text-center py-8">No messages{fileFilter ? ' in this file thread' : ''} — say hello.</p>}
+              <div ref={msgEndRef} />
             </div>
             {/* Typing indicator */}
             {Object.keys(typingUsers).length > 0 && (
