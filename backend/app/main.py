@@ -38,21 +38,35 @@ async def ws_events(ws: WebSocket):
     await manager.connect(ws)
     try:
         while True:
-            msg = await ws.receive_json()
-            if msg.get("action") == "PING":
-                await ws.send_json({"event": "PONG", "data": {}})
-            elif msg.get("action") == "ACK_ALERT":
-                db = SessionLocal()
-                try:
-                    from app.db.models.models import AlertReceipt
-                    r = db.query(AlertReceipt).filter(
-                        AlertReceipt.alert_id == msg.get("alert_id")).first()
-                    if r:
-                        r.acked_at = datetime.utcnow()
-                        db.commit()
-                finally:
-                    db.close()
-    except WebSocketDisconnect:
+            try:
+                msg = await ws.receive_json()
+            except WebSocketDisconnect:
+                break
+            except RuntimeError:
+                # client disconnected mid-receive (proxy reset, tab closed)
+                break
+            except Exception:
+                # malformed frame — ignore, keep connection alive
+                continue
+            try:
+                if msg.get("action") == "PING":
+                    await ws.send_json({"event": "PONG", "data": {}})
+                elif msg.get("action") == "ACK_ALERT":
+                    db = SessionLocal()
+                    try:
+                        from app.db.models.models import AlertReceipt
+                        r = db.query(AlertReceipt).filter(
+                            AlertReceipt.alert_id == msg.get("alert_id")).first()
+                        if r:
+                            r.acked_at = datetime.utcnow()
+                            db.commit()
+                    finally:
+                        db.close()
+            except (WebSocketDisconnect, RuntimeError):
+                break
+            except Exception:
+                continue
+    finally:
         manager.disconnect(ws)
 
 

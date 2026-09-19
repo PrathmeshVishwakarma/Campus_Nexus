@@ -99,23 +99,36 @@ export default function Chat() {
   cidRef.current = cid
   const fileRef = useRef(fileFilter)
   fileRef.current = fileFilter
+  const userRef = useRef(user)
+  userRef.current = user
 
   useEffect(() => { loadCh(); loadUsers() }, [])
   useEffect(() => { loadMsg() }, [cid, fileFilter])
   useEffect(() => { setFileFilter(fileParam) }, [fileParam])
 
+  // Keep latest loaders in refs so the long-lived socket/poll never
+  // call a stale closure (the old bug: interval captured cid=null from
+  // first render, so live MESSAGE_SENT never refreshed the open channel).
+  const loadChRef = useRef(loadCh)
+  loadChRef.current = loadCh
+  const loadMsgRef = useRef(loadMsg)
+  loadMsgRef.current = loadMsg
+
   // Live updates: WebSocket MESSAGE_SENT events for instant refresh,
   // plus a quiet 4s poll as fallback if the socket drops.
   useEffect(() => {
-    let ws: WebSocket | null = null
     let alive = true
+    let ws: WebSocket | null = null
+    let retry = 0
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+    let pingTimer: ReturnType<typeof setInterval> | null = null
     const onEvent = (raw: string) => {
       try {
         const e = JSON.parse(raw)
         if (e.event === 'TYPING') {
-          const chId = e.data?.payload?.channel_id
+          const chId = e.data?.payload?.channel_id ?? e.data?.channel_id
           const actor: string = e.data?.actor || ''
-          if (chId === cidRef.current && actor !== user) {
+          if (chId === cidRef.current && actor !== userRef.current) {
             setTypingUsers(prev => ({ ...prev, [actor]: true }))
             clearTimeout(typingTimers.current[actor])
             typingTimers.current[actor] = setTimeout(() => {
@@ -124,20 +137,51 @@ export default function Chat() {
           }
           return
         }
+        if (e.event === 'PONG') return
         if (e.event !== 'MESSAGE_SENT') return
         const resource: string = e.data?.resource || ''
         const m = resource.match(/^channel:(\d+)/)
         // channel list can change on any message event (new/renamed/deleted channel)
-        loadCh(true)
-        if (m && Number(m[1]) === cidRef.current) loadMsg(true)
+        loadChRef.current(true)
+        if (m && Number(m[1]) === cidRef.current) loadMsgRef.current(true)
       } catch { /* ignore malformed frames */ }
     };
-    try {
-      ws = new WebSocket(`ws://${location.host}/ws/events?token=${token}`)
+    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
+    const connect = () => {
+      if (!alive) return
+      try {
+        ws = new WebSocket(`${scheme}://${location.host}/ws/events?token=${token}`)
+      } catch { scheduleRetry(); return }
+      ws.onopen = () => { retry = 0 }
       ws.onmessage = (msg) => { if (alive) onEvent(msg.data) }
-    } catch { ws = null }
-    const poll = setInterval(() => { if (alive && !document.hidden) { loadCh(true); loadMsg(true) } }, 4000)
-    return () => { alive = false; clearInterval(poll); try { ws?.close() } catch {} }
+      ws.onerror = () => { try { ws?.close() } catch {} }
+      ws.onclose = () => { scheduleRetry() }
+    }
+    const scheduleRetry = () => {
+      if (!alive) return
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
+      retry = Math.min(retry + 1, 5)
+      const delay = Math.min(1000 * 2 ** retry, 10000)
+      if (retryTimer) clearTimeout(retryTimer)
+      retryTimer = setTimeout(() => { if (alive) connect() }, delay)
+    }
+    connect()
+    // heartbeat keeps Vite's dev proxy + idle connections alive
+    pingTimer = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ action: 'PING' })) } catch {}
+      }
+    }, 25000)
+    const poll = setInterval(() => {
+      if (alive && !document.hidden) { loadChRef.current(true); loadMsgRef.current(true) }
+    }, 4000)
+    return () => {
+      alive = false
+      clearInterval(poll)
+      if (pingTimer) clearInterval(pingTimer)
+      if (retryTimer) clearTimeout(retryTimer)
+      try { ws?.close() } catch {}
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token])
 

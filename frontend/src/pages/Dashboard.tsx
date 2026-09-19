@@ -17,14 +17,42 @@ export function Dashboard() {
 
   useEffect(() => {
     api('/api/events?limit=200', { headers: { Authorization: `Bearer ${token}` } }).then(setEvents).catch(() => {});
-    const ws = new WebSocket(`ws://${location.host}/ws/events?token=${token}`);
-    ws.onmessage = (m) => {
+    let alive = true
+    let ws: WebSocket | null = null
+    let retry = 0
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
+    const connect = () => {
+      if (!alive) return
       try {
-        const d = JSON.parse(m.data);
-        setEvents(prev => [{ id: d.data.id, type: d.event, actor: d.data.actor, resource: d.data.resource, timestamp: d.data.timestamp, priority: d.data.priority }, ...prev].slice(0, 500));
-      } catch {}
-    };
-    return () => ws.close();
+        ws = new WebSocket(`${scheme}://${location.host}/ws/events?token=${token}`);
+      } catch { scheduleRetry(); return }
+      ws.onopen = () => { retry = 0 }
+      ws.onmessage = (m) => {
+        if (!alive) return
+        try {
+          const d = JSON.parse(m.data);
+          if (d.event === 'PONG' || d.event === 'TYPING') return
+          setEvents(prev => [{ id: d.data.id, type: d.event, actor: d.data.actor, resource: d.data.resource, timestamp: d.data.timestamp, priority: d.data.priority }, ...prev].slice(0, 500));
+        } catch {}
+      };
+      ws.onerror = () => { try { ws?.close() } catch {} }
+      ws.onclose = () => { scheduleRetry() }
+    }
+    const scheduleRetry = () => {
+      if (!alive) return
+      retry = Math.min(retry + 1, 5)
+      const delay = Math.min(1000 * 2 ** retry, 10000)
+      if (retryTimer) clearTimeout(retryTimer)
+      retryTimer = setTimeout(() => { if (alive) connect() }, delay)
+    }
+    connect()
+    const ping = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ action: 'PING' })) } catch {}
+      }
+    }, 25000)
+    return () => { alive = false; clearInterval(ping); if (retryTimer) clearTimeout(retryTimer); try { ws?.close() } catch {} };
   }, [token]);
 
   const shown = events.filter(e => !query || `${e.type} ${e.actor} ${e.resource}`.toLowerCase().includes(query.toLowerCase()))
