@@ -1,18 +1,19 @@
-import React, { useEffect, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import { motion, AnimatePresence } from 'framer-motion'
-import { Activity, Bell, Files, MessageSquare, Moon, Network, Search, Sun } from 'lucide-react'
+import React, { useEffect, useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
+import { motion } from 'framer-motion'
+import { Activity, Bell, Files, MessageSquare, Search } from 'lucide-react'
 import { useAuth } from '../store/useAuth'
 import { api } from '../store/useAuth'
 import { Button } from '../components/ui/button'
 import { Card } from '../components/ui/card'
+import {
+  AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid
+} from 'recharts'
 
 export function Dashboard() {
   const [events, setEvents] = useState<any[]>([])
   const [query, setQuery] = useState('')
   const { user, token } = useAuth()
-  const [light, setLight] = useState(() => localStorage.getItem('nexus_theme') === 'light')
-  useEffect(() => { localStorage.setItem('nexus_theme', light ? 'light' : 'dark') }, [light])
 
   useEffect(() => {
     api('/api/events?limit=200', { headers: { Authorization: `Bearer ${token}` } }).then(setEvents).catch(() => {});
@@ -23,8 +24,6 @@ export function Dashboard() {
         setEvents(prev => [{ id: d.data.id, type: d.event, actor: d.data.actor, resource: d.data.resource, timestamp: d.data.timestamp, priority: d.data.priority }, ...prev].slice(0, 500));
       } catch {}
     };
-    ws.onopen = () => {};
-    ws.onclose = () => {};
     return () => ws.close();
   }, [token]);
 
@@ -37,7 +36,26 @@ export function Dashboard() {
     { icon: Activity, label: 'Total events', getVal: () => events.length },
   ]
 
-  const tileKey = (t: typeof tiles[number], index: number) => `${t.icon}-${index}`
+  // Build hourly bucketed data for the area chart
+  const chartData = useMemo(() => {
+    const now = Date.now()
+    const buckets: Record<string, number> = {}
+    // Last 12 hours, 1-hour slots
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now - i * 3600_000)
+      const label = `${d.getHours().toString().padStart(2, '0')}:00`
+      buckets[label] = 0
+    }
+    for (const e of events) {
+      if (!e.timestamp) continue
+      const t = new Date(e.timestamp)
+      const age = now - t.getTime()
+      if (age > 12 * 3600_000) continue
+      const label = `${t.getHours().toString().padStart(2, '0')}:00`
+      if (label in buckets) buckets[label]++
+    }
+    return Object.entries(buckets).map(([hour, count]) => ({ hour, count }))
+  }, [events])
 
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--fg)] antialiased">
@@ -47,32 +65,7 @@ export function Dashboard() {
             position: 'fixed',
             inset: 0,
             pointerEvents: 'none',
-            top: 0,
-            left: 0,
-            width: '100%',
-            height: '100%',
-            background: `linear-gradient(135deg, var(--bg-subtle) 0%, ${light ? 'rgba(255,255,255,0.03)' : 'rgba(15,15,25,0.3)'} 100%)`,
-            animation: 'gradient-x 15s ease infinite',
-          }}
-        />
-        <motion.rect
-          style={{
-            position: 'absolute',
-            width: 600,
-            height: 600,
-            borderRadius: '50%',
-            background: `rgba(139, 92, 246, 0.15)`,
-            opacity: 0.6,
-          }}
-        />
-        <motion.rect
-          style={{
-            position: 'absolute',
-            width: 400,
-            height: 400,
-            borderRadius: '50%',
-            background: `rgba(99, 102, 241, 0.1)`,
-            opacity: 0.4,
+            background: 'linear-gradient(135deg, var(--bg-subtle) 0%, rgba(15,15,25,0.3) 100%)',
           }}
         />
 
@@ -88,10 +81,6 @@ export function Dashboard() {
                   <Search size={14} className="text-muted-foreground shrink-0" />
                   <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search events, actors, files…" className="bg-transparent outline-none text-sm w-full placeholder-[var(--muted)] focus:outline-none" />
                 </div>
-
-                <button onClick={() => setLight(v => !v)} className="ml-auto rounded-lg p-2 transition-colors hover:bg-[rgba(167,139,250,0.25)]" aria-label="Toggle theme">
-                  {light ? <Moon size={15} className="text-[var(--muted)]" /> : <Sun size={15} className="text-[var(--accent)]" />}
-                </button>
               </div>
 
               <p className="mt-2 text-sm text-[var(--muted)]">
@@ -107,12 +96,40 @@ export function Dashboard() {
                 <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
                   {tiles.map((t, i) => (
                     <Card key={`${t.icon}-${i}`} className="p-4 flex flex-col items-center gap-1.5 text-center">
-                      <t.icon key="icon" size={16} className="text-[var(--accent)]" />
+                      <t.icon size={16} className="text-[var(--accent)]" />
                       <div className="text-2xl font-bold leading-none">{t.getVal()}</div>
                       <div className="text-[var(--muted)] text-xs sm:text-sm">{t.label}</div>
                     </Card>
                   ))}
                 </div>
+              </Card>
+
+              {/* Events/hour area chart */}
+              <Card>
+                <h2 className="text-[var(--accent)] font-semibold tracking-tight mb-3">Events / Hour (last 12 h)</h2>
+                {chartData.some(d => d.count > 0) ? (
+                  <ResponsiveContainer width="100%" height={180}>
+                    <AreaChart data={chartData} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
+                      <defs>
+                        <linearGradient id="evtGrad" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="var(--accent)" stopOpacity={0.3} />
+                          <stop offset="95%" stopColor="var(--accent)" stopOpacity={0} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                      <XAxis dataKey="hour" tick={{ fontSize: 10, fill: 'var(--muted)' }} />
+                      <YAxis allowDecimals={false} tick={{ fontSize: 10, fill: 'var(--muted)' }} />
+                      <Tooltip
+                        contentStyle={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }}
+                        labelStyle={{ color: 'var(--accent)' }}
+                        itemStyle={{ color: 'var(--fg)' }}
+                      />
+                      <Area type="monotone" dataKey="count" stroke="var(--accent)" fill="url(#evtGrad)" strokeWidth={2} dot={false} name="Events" />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <p className="text-sm text-[var(--muted)] text-center py-8">No events in the last 12 hours — activity will appear here in real time.</p>
+                )}
               </Card>
 
               <Card>
@@ -132,7 +149,7 @@ export function Dashboard() {
                     <div className="text-xs text-[var(--muted)] mt-1">Raise a broadcast, track ACKs and delivery receipts</div>
                   </Link>
                   <Link to="/network" className="rounded-xl border border-[var(--border)] bg-[var(--card-hover)] p-3 hover:bg-[var(--card-hover)] transition-colors">
-                    <div className="flex items-center gap-2 font-medium text-sm"><Network size={15} className="text-[var(--accent)]" /> Network</div>
+                    <div className="flex items-center gap-2 font-medium text-sm"><Activity size={15} className="text-[var(--accent)]" /> Network</div>
                     <div className="text-xs text-[var(--muted)] mt-1">Peers, topology, scheduler queue, anomaly state</div>
                   </Link>
                 </div>
@@ -141,7 +158,7 @@ export function Dashboard() {
               <Card>
                 <h2 className="text-[var(--accent)] font-semibold tracking-tight mb-3">Event Timeline</h2>
                 <p className="text-[var(--muted)] text-sm mb-3">
-                  {shown.length} of {events.length} events{query ? <> matching <span className="font-medium text-[var(--accent)]">“{query}”</span></> : ''}
+                  {shown.length} of {events.length} events{query ? <> matching <span className="font-medium text-[var(--accent)]">"{query}"</span></> : ''}
                 </p>
 
                 <div className="space-y-2 max-h-[500px] overflow-auto pr-1">

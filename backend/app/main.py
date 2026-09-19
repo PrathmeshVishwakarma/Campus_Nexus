@@ -13,7 +13,7 @@ from app.db.session import SessionLocal, engine
 from app.schemas import EventCreate
 from app.services import event_service, scheduler
 
-Base.metadata.create_all(bind=engine)
+# Base.metadata.create_all(bind=engine) # Now managed by Alembic
 event_service.set_broadcaster(broadcast_event)
 
 app = FastAPI(title="Campus Nexus", version="0.2.0")

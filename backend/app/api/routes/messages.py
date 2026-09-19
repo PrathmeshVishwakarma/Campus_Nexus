@@ -151,6 +151,16 @@ def mark_read(msg_id: int, db: Session = Depends(get_db), user=Depends(get_curre
     return {"ok": True}
 
 
+@router.post("/typing")
+async def typing(channel_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Emit a transient TYPING event — no DB write, just broadcast."""
+    await event_service.emit_event(db, EventCreate(
+        type="TYPING", actor=user.username,
+        resource=f"channel:{channel_id}", priority=10,
+        payload={"channel_id": channel_id}))
+    return {"ok": True}
+
+
 @router.get("/unread/count")
 def unread(channel_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
     n = db.query(Message).filter(Message.channel_id == channel_id,

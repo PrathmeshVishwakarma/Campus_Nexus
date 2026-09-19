@@ -18,7 +18,12 @@ def ping_host(host: str, port: int = 80, timeout: float = 1.0) -> float | None:
 
 def net_io_snapshot() -> dict:
     c = psutil.net_io_counters()
-    return {"bytes_sent": c.bytes_sent, "bytes_recv": c.bytes_recv}
+    return {
+        "bytes_sent": c.bytes_sent,
+        "bytes_recv": c.bytes_recv,
+        "dropin": c.dropin,   # inbound packets dropped
+        "dropout": c.dropout, # outbound packets dropped
+    }
 
 
 def is_congested(bytes_sent_per_sec: float, threshold: float = 5_000_000) -> bool:
