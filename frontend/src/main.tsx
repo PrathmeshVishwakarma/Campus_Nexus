@@ -7,6 +7,7 @@ import { Toaster } from 'sonner'
 import { useAuth } from './store/useAuth'
 import { Dashboard } from './pages/Dashboard'
 import Files from './pages/Files'
+import FileDiscussion from './pages/FileDiscussion'
 import Chat from './pages/Chat'
 import Alerts from './pages/Alerts'
 import Network from './pages/Network'
@@ -45,6 +46,7 @@ function App() {
         <Route path="/register" element={<Register />} />
         <Route path="/" element={<PrivateRoute><Dashboard /></PrivateRoute>} />
         <Route path="/files" element={<PrivateRoute><Files /></PrivateRoute>} />
+        <Route path="/files/discussion" element={<PrivateRoute><FileDiscussion /></PrivateRoute>} />
         <Route path="/chat" element={<PrivateRoute><Chat /></PrivateRoute>} />
         <Route path="/alerts" element={<PrivateRoute><Alerts /></PrivateRoute>} />
         <Route path="/network" element={<PrivateRoute><Network /></PrivateRoute>} />

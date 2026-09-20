@@ -154,10 +154,10 @@ def mark_read(msg_id: int, db: Session = Depends(get_db), user=Depends(get_curre
 @router.post("/typing")
 async def typing(channel_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
     """Emit a transient TYPING event — no DB write, just broadcast."""
-    await event_service.emit_event(db, EventCreate(
-        type="TYPING", actor=user.username,
-        resource=f"channel:{channel_id}", priority=10,
-        payload={"channel_id": channel_id}))
+    from app.api.websockets.events_ws import broadcast_event
+    await broadcast_event("TYPING", {"actor": user.username,
+                                     "resource": f"channel:{channel_id}",
+                                     "payload": {"channel_id": channel_id}})
     return {"ok": True}
 
 
