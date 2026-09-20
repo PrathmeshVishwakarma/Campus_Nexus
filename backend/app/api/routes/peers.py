@@ -76,6 +76,6 @@ def stats(user=Depends(get_current_user)):
 
 @router.get("/ml/anomalies")
 def anomalies(user=Depends(get_current_user)):
-    from app.ml.anomaly import WINDOW
-    return {"windows_tracked": len(WINDOW), "scheduler_paused": scheduler.is_paused(),
+    from app.ml.anomaly import status as ml_status
+    return {**ml_status(), "scheduler_paused": scheduler.is_paused(),
             "throttle": scheduler.throttle_status()}
