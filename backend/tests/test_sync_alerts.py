@@ -30,6 +30,8 @@ def test_chunk_sync_version_conflict_flow():
     assert client.get(f"/api/sync/manifest?path={path}", headers=h).json()["exists"] is True
     assert client.get(f"/api/files/download?path={path}", headers=h).status_code == 200
     assert client.post(f"/api/files/resolve?path={path}&strategy=latest", json={}, headers=h).json()["ok"] is True
+    # cleanup so test runs don't pollute the shared folder
+    assert client.delete(f"/api/files/item?path={path}", headers=h).status_code == 200
 
 
 def test_alerts_ranked_and_ack():

@@ -94,4 +94,15 @@ class FileCommentCreate(BaseModel):
     content: str
 
 
+class FolderDiffFile(BaseModel):
+    path: str
+    sha256: str = ""
+    size: int = 0
+
+
+class FolderDiffRequest(BaseModel):
+    base: str = ""
+    files: list[FolderDiffFile] = []
+
+
 PRIORITY_MAP = {"CRITICAL": 100, "URGENT": 80, "IMPORTANT": 60, "NORMAL": 40, "INFO": 10}

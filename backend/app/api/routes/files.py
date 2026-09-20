@@ -1,11 +1,8 @@
-"""Single-root shared files: one 'root' for all users, per-subfolder member ACL.
-
-Layout on disk: <root>/<subfolder>/...  Root-level files are public to all
-authenticated users. A top-level subfolder with a FolderACL row is visible
-only to its members (plus admins). No ACL row = public (backwards compatible).
-"""
+"""Single-root shared files: one 'root' for all users, per-subfolder member ACL."""
 import hashlib
 import shutil
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +28,7 @@ from app.schemas import (
     EventCreate,
     FileCommentCreate,
     FolderACLUpdate,
+    FolderDiffRequest,
     FolderMembersUpdate,
     RootUpdate,
     ShareFolderCreate,
@@ -183,11 +181,25 @@ def list_folders(db: Session = Depends(get_db), user=Depends(get_current_user)):
 @router.post("/files/folders")
 async def upsert_folder_acl(data: FolderACLUpdate, subfolder: str,
                             db: Session = Depends(get_db), user=Depends(get_current_user)):
-    """Create/update a subfolder + its member list (admin only)."""
-    _require_admin(user)
+    """Create/update a subfolder + its member list.
+
+    Anyone may set members on a folder with no ACL yet (e.g. right after
+    uploading a new folder); changing an existing locked folder is admin-only.
+    """
     sub = (subfolder or "").strip().strip("/")
     if not sub or "/" in sub or sub in (".", ".."):
         raise HTTPException(400, "Subfolder must be a single top-level name")
+    existing = db.query(FolderACL).filter(FolderACL.subfolder == sub).first()
+    if existing and not _is_admin(user):
+        raise HTTPException(403, "Admin only — folder access is already set")
+    if not (data.members or []):
+        # empty = public: no ACL row (a stored empty row would lock everyone out)
+        if existing:
+            db.delete(existing)
+            db.commit()
+        root = get_root(db)
+        (root / sub).mkdir(parents=True, exist_ok=True)
+        return {"ok": True, "subfolder": sub, "members": [], "locked": False}
     root = get_root(db)
     (root / sub).mkdir(parents=True, exist_ok=True)
     # validate members exist
@@ -206,7 +218,7 @@ async def upsert_folder_acl(data: FolderACLUpdate, subfolder: str,
     await event_service.emit_event(db, EventCreate(type="FOLDER_ACL_UPDATED", actor=user.username,
                                                    resource=sub, priority=60,
                                                    payload={"members": data.members or []}))
-    return {"ok": True, "subfolder": sub, "members": data.members or []}
+    return {"ok": True, "subfolder": sub, "members": data.members or [], "locked": True}
 
 
 @router.post("/files/folders/{subfolder}/members")
@@ -224,6 +236,12 @@ async def update_folder_members(subfolder: str, data: FolderMembersUpdate,
             raise HTTPException(400, f"User '{u}' does not exist")
         if u not in members:
             members.append(u)
+    if not members:
+        # empty = public: no ACL row
+        if row:
+            db.delete(row)
+            db.commit()
+        return {"ok": True, "subfolder": subfolder, "members": [], "locked": False}
     if not row:
         row = FolderACL(subfolder=subfolder, members=members, updated_by=user.username)
         db.add(row)
@@ -232,7 +250,7 @@ async def update_folder_members(subfolder: str, data: FolderMembersUpdate,
         row.updated_by = user.username
         row.updated_at = datetime.utcnow()
     db.commit()
-    return {"ok": True, "subfolder": subfolder, "members": members}
+    return {"ok": True, "subfolder": subfolder, "members": members, "locked": True}
 
 
 @router.delete("/files/folders/{subfolder}")
@@ -245,6 +263,95 @@ async def delete_folder_acl(subfolder: str, db: Session = Depends(get_db),
         db.delete(row)
         db.commit()
     return {"ok": True, "subfolder": subfolder, "locked": False}
+
+
+@router.post("/files/folder-diff")
+def folder_diff(data: FolderDiffRequest, db: Session = Depends(get_db),
+                user=Depends(get_current_user)):
+    """Compare a local folder against the server before uploading.
+
+    Returns per-file status: new | unchanged | changed (+ server size).
+    Used by the folder-upload flow for Windows-style keep/overwrite prompts.
+    """
+    root = get_root(db)
+    admin = _is_admin(user)
+    out = []
+    for f in data.files or []:
+        try:
+            rel = _safe_rel(f.path)
+        except HTTPException:
+            out.append({"path": f.path, "status": "invalid", "server_size": 0})
+            continue
+        if not can_access(db, user.username, admin, rel):
+            out.append({"path": f.path, "status": "forbidden", "server_size": 0})
+            continue
+        target = root / rel
+        if not target.exists() or not target.is_file():
+            out.append({"path": rel, "status": "new", "server_size": 0})
+            continue
+        try:
+            server_sha = sha256_file(target)
+        except Exception:
+            server_sha = ""
+        if f.sha256 and server_sha and f.sha256 == server_sha:
+            status = "unchanged"
+        else:
+            status = "changed"
+        out.append({"path": rel, "status": status, "server_size": target.stat().st_size})
+    base_exists = False
+    if data.base:
+        base = data.base.strip().strip("/")
+        if base and "/" not in base:
+            base_exists = (root / base).exists()
+    return {"files": out, "base_exists": base_exists}
+
+
+@router.delete("/files/item")
+async def delete_item(path: str, db: Session = Depends(get_db),
+                      user=Depends(get_current_user)):
+    """Delete a file or top-level subfolder (any user with folder access).
+
+    Removes disk data + version history + discussion thread, keeps audit events.
+    """
+    rel = _safe_rel(path)
+    if rel in ("root",):
+        raise HTTPException(400, "Cannot delete root")
+    _require_access(db, user, rel)
+    root = get_root(db)
+    target = root / rel
+    if not target.exists():
+        raise HTTPException(404, "Not found")
+    is_dir = target.is_dir()
+    if is_dir and "/" in rel:
+        raise HTTPException(400, "Only top-level subfolders can be deleted")
+    n_files = 0
+    if is_dir:
+        n_files = sum(1 for _ in target.rglob("*") if _.is_file())
+        shutil.rmtree(target)
+        db.query(FileVersion).filter(
+            (FileVersion.file_path == rel) |
+            (FileVersion.file_path.startswith(rel + "/"))).delete(synchronize_session=False)
+        for th in db.query(FileThread).filter(
+                (FileThread.file_path == rel) |
+                (FileThread.file_path.startswith(rel + "/"))).all():
+            db.query(FileComment).filter(FileComment.thread_id == th.id).delete()
+            db.delete(th)
+        acl = db.query(FolderACL).filter(FolderACL.subfolder == rel).first()
+        if acl:
+            db.delete(acl)
+    else:
+        target.unlink()
+        n_files = 1
+        db.query(FileVersion).filter(FileVersion.file_path == rel).delete()
+        th = db.query(FileThread).filter(FileThread.file_path == rel).first()
+        if th:
+            db.query(FileComment).filter(FileComment.thread_id == th.id).delete()
+            db.delete(th)
+    db.commit()
+    await event_service.emit_event(db, EventCreate(type="FILE_DELETED", actor=user.username,
+                                                   resource=rel, priority=60,
+                                                   payload={"was_dir": is_dir, "files": n_files}))
+    return {"ok": True, "path": rel, "was_dir": is_dir, "files": n_files}
 
 
 # legacy: share-a-folder now creates a subfolder ACL entry
@@ -554,6 +661,39 @@ async def report_activity(n_modified: int = 0, n_deleted: int = 0, n_created: in
                                    "created": n_created, "mb": total_mb, "score": score}))
         return {"anomaly": True, "action": "sync paused, versions preserved", "score": score}
     return {"anomaly": False, "score": score}
+
+
+@router.post("/files/reveal")
+def reveal_in_browser(path: str | None = None, db: Session = Depends(get_db),
+                      user=Depends(get_current_user)):
+    """Open root (or a file/subfolder) in the server's file browser.
+
+    No path = open the root itself. A file path reveals+selects the file
+    (macOS `open -R`, Windows `explorer /select`); a folder opens directly.
+    Only works when the browser runs on the same machine as the server —
+    on a headless host this returns 500 with the path so the UI can show it.
+    """
+    root = get_root(db)
+    target = root
+    if path:
+        rel = _safe_rel(path)
+        _require_access(db, user, rel)
+        target = root / rel
+        if not target.exists():
+            raise HTTPException(404, "Not found")
+    try:
+        if sys.platform == "darwin":
+            cmd = ["open", "-R", str(target)] if target.is_file() else ["open", str(target)]
+        elif sys.platform == "win32":
+            cmd = ["explorer", f"/select,{target}"] if target.is_file() else ["explorer", str(target)]
+        else:
+            folder = str(target if target.is_dir() else target.parent)
+            opener = shutil.which("xdg-open") or shutil.which("gio")
+            cmd = ["xdg-open", folder] if opener and "xdg" in opener else ["gio", "open", folder]
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        raise HTTPException(500, f"Cannot open file browser on server ({e}). Path: {target}")
+    return {"ok": True, "path": str(target)}
 
 
 @router.get("/files/download")
