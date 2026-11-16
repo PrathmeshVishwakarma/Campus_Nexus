@@ -2,6 +2,8 @@ import * as React from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
 import { Activity, Bell, FolderOpen, LogOut, MessageSquare, Moon, Network, Sun } from 'lucide-react'
 import { useAuth } from '../store/useAuth'
+import { OfflineBanner } from './OfflineBanner'
+import AnomalyBanner from './AnomalyBanner'
 
 const links = [
   { to: '/', label: 'Dashboard', icon: Activity, end: true },
@@ -80,6 +82,12 @@ export function Shell({ children }: { children: React.ReactNode }) {
             </button>
           </div>
         </nav>
+      )}
+      <OfflineBanner />
+      {token && (
+        <div className="max-w-7xl mx-auto px-4 pt-3">
+          <AnomalyBanner />
+        </div>
       )}
       {children}
     </div>

@@ -121,3 +121,45 @@ class SyncTask(Base):
     status: Mapped[str] = mapped_column(String(32), default="queued")
     retries: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SharedFolderMember(Base):
+    """ACL row: which users may access a restricted SharedFolder.
+
+    A folder with NO member rows is public (everyone can see it). As soon as it
+    has one or more rows, it is restricted to those usernames (plus its owner).
+    """
+
+    __tablename__ = "shared_folder_members"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    folder_id: Mapped[int] = mapped_column(ForeignKey("shared_folders.id"), index=True)
+    username: Mapped[str] = mapped_column(String(64), index=True)
+    permission: Mapped[str] = mapped_column(String(16), default="edit")  # view | edit
+
+
+class AppSetting(Base):
+    """Simple key/value store for node-level settings (e.g. the shared root path)."""
+
+    __tablename__ = "app_settings"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+
+
+class NotificationPreference(Base):
+    """Per-user notification settings (Feature 3)."""
+
+    __tablename__ = "notification_preferences"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)          # master switch
+    enable_messages: Mapped[bool] = mapped_column(Boolean, default=True)
+    enable_file_events: Mapped[bool] = mapped_column(Boolean, default=True)
+    enable_alerts: Mapped[bool] = mapped_column(Boolean, default=True)
+    min_alert_priority: Mapped[str] = mapped_column(String(16), default="INFO")
+    mute_channel_ids: Mapped[list] = mapped_column(JSON, default=list)
+    mute_folder_paths: Mapped[list] = mapped_column(JSON, default=list)
+    dnd_start: Mapped[str] = mapped_column(String(5), default="")         # "HH:MM" or ""
+    dnd_end: Mapped[str] = mapped_column(String(5), default="")
+    sound: Mapped[bool] = mapped_column(Boolean, default=True)
+    desktop_toast: Mapped[bool] = mapped_column(Boolean, default=True)
+    email_digest: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

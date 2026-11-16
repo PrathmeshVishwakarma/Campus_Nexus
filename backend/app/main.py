@@ -6,14 +6,21 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import alerts, auth, events, files, messages, peers
+from app.api.routes import alerts, auth, events, files, messages, notifications, peers
 from app.api.websockets.events_ws import broadcast_event, manager
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
 from app.schemas import EventCreate
 from app.services import event_service, scheduler
 
-# Base.metadata.create_all(bind=engine) # Now managed by Alembic
+# Alembic owns the full migration history, but create_all is idempotent and only
+# creates tables that don't yet exist. This guarantees newer tables
+# (shared_folder_members, app_settings, notification_preferences) are present for
+# both `uvicorn` and the pytest suite without requiring a manual `alembic upgrade`.
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as _e:  # pragma: no cover - never block startup on this
+    print("[main] create_all skipped:", _e)
 event_service.set_broadcaster(broadcast_event)
 
 app = FastAPI(title="Campus Nexus", version="0.2.0")
@@ -26,6 +33,7 @@ app.include_router(files.router)
 app.include_router(messages.router)
 app.include_router(alerts.router)
 app.include_router(peers.router)
+app.include_router(notifications.router)
 
 
 @app.get("/health")

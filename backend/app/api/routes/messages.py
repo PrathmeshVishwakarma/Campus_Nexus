@@ -17,7 +17,9 @@ def _require_member(channel: Channel, username: str):
 
 @router.get("/channels")
 def channels(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    rows = db.query(Channel).all()
+    # 'file' channels back the per-file discussion panel in the Files page and
+    # must not pollute the general Chat list (groups/DMs only).
+    rows = db.query(Channel).filter(Channel.type != "file").all()
     return [{"id": c.id, "name": c.name, "type": c.type, "members": c.members} for c in rows]
 
 
@@ -135,7 +137,9 @@ async def send(data: MessageCreate, db: Session = Depends(get_db), user=Depends(
     await event_service.emit_event(db, EventCreate(type="MESSAGE_SENT", actor=user.username,
                                                    resource=resource, priority=80,
                                                    payload={"text": data.content[:200],
-                                                            "file": data.file_link}))
+                                                            "file": data.file_link,
+                                                            "channel_id": data.channel_id,
+                                                            "message_id": m.id}))
     return {"id": m.id, "channel_id": m.channel_id, "sender": m.sender,
             "content": m.content, "file_link": m.file_link,
             "created_at": m.created_at.isoformat()}

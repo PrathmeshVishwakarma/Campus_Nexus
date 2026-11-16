@@ -14,8 +14,8 @@ export default function AnomalyBanner() {
     await api('/api/sync/resume-scheduler', { method: 'POST', body: JSON.stringify({}) })
     toast.success('Sync resumed'); setPaused(false)
   }
-  return <div className="rounded-2xl border border-rose-500/40 bg-rose-500/10 p-4 flex items-center gap-3">
-    <ShieldAlert className="text-rose-300" />
+  return <div className="rounded-2xl border-2 border-rose-500 bg-rose-600/30 p-4 flex items-center gap-3 shadow-lg shadow-rose-900/40">
+    <ShieldAlert className="text-rose-200" size={22} />
     <div className="text-sm"><b className="text-rose-200">Anomaly detected — sync paused, versions preserved.</b>
       <div className="text-rose-300/80 text-xs">Possible mass modify/delete. Review timeline, then resume.</div></div>
     <button onClick={resume} className="ml-auto px-4 py-2 rounded-xl bg-emerald-600 font-semibold text-sm">Review & Resume</button>
