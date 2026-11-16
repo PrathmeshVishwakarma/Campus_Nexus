@@ -76,4 +76,33 @@ class ShareFolderCreate(BaseModel):
     path: str
 
 
+class RootUpdate(BaseModel):
+    path: str
+
+
+class FolderACLUpdate(BaseModel):
+    members: list[str] = []
+
+
+class FolderMembersUpdate(BaseModel):
+    add: list[str] = []
+    remove: list[str] = []
+
+
+class FileCommentCreate(BaseModel):
+    file_path: str
+    content: str
+
+
+class FolderDiffFile(BaseModel):
+    path: str
+    sha256: str = ""
+    size: int = 0
+
+
+class FolderDiffRequest(BaseModel):
+    base: str = ""
+    files: list[FolderDiffFile] = []
+
+
 PRIORITY_MAP = {"CRITICAL": 100, "URGENT": 80, "IMPORTANT": 60, "NORMAL": 40, "INFO": 10}

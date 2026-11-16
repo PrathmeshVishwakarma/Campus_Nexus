@@ -33,6 +33,45 @@ class SharedFolder(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class RootConfig(Base):
+    """Singleton (id=1) holding the single shared root folder location."""
+    __tablename__ = "root_config"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    path: Mapped[str] = mapped_column(String(1024), default="shared/demo_files")
+    updated_by: Mapped[str] = mapped_column(String(64), default="system")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
+                                                 onupdate=datetime.utcnow)
+
+
+class FolderACL(Base):
+    """Per-top-level-subfolder member list. No row = public to all users."""
+    __tablename__ = "folder_acl"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    subfolder: Mapped[str] = mapped_column(String(512), unique=True, index=True)
+    members: Mapped[list] = mapped_column(JSON, default=list)
+    updated_by: Mapped[str] = mapped_column(String(64), default="system")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
+                                                 onupdate=datetime.utcnow)
+
+
+class FileThread(Base):
+    """One discussion thread per file — detached from chat channels."""
+    __tablename__ = "file_threads"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    file_path: Mapped[str] = mapped_column(String(512), unique=True, index=True)
+    created_by: Mapped[str] = mapped_column(String(64), default="unknown")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class FileComment(Base):
+    __tablename__ = "file_comments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    thread_id: Mapped[int] = mapped_column(ForeignKey("file_threads.id"), index=True)
+    sender: Mapped[str] = mapped_column(String(64))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class FileVersion(Base):
     __tablename__ = "file_versions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
