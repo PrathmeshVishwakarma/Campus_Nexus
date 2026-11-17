@@ -17,11 +17,14 @@ services:
     ports: ["8000:8000"]
     environment:
       DATABASE_URL: postgresql://nexus:nexus@db:5432/campus_nexus
-    volumes: ["./shared:/app/shared"]
+      VAPID_PRIVATE_KEY_FILE: /app/.secrets/vapid_private.pem
+    volumes:
+      - "./shared:/app/shared"
+      - "vapid:/app/.secrets"
     depends_on:
       db:
         condition: service_healthy
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
   frontend:
     build: ./frontend
@@ -30,3 +33,4 @@ services:
 
 volumes:
   pgdata:
+  vapid:

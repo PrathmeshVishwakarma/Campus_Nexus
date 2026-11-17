@@ -44,6 +44,72 @@ def test_alerts_ranked_and_ack():
     assert any(r["user"] for r in client.get(f"/api/alerts/{a['id']}/receipts", headers=h).json())
 
 
+def test_unacked_badge_count_and_top_priority():
+    from app.db.models.models import Alert, AlertReceipt
+    from app.db.session import SessionLocal
+
+    _, sender_h = _user()          # raises alerts
+    _, h = _user()                 # recipient
+    created = []
+    try:
+        for p in ("IMPORTANT", "INFO", "CRITICAL"):
+            created.append(client.post("/api/alerts", json={
+                "title": f"badge {p}", "body": "b", "priority": p}, headers=sender_h).json()["id"])
+
+        r = client.get("/api/alerts/unacked/count", headers=h).json()
+        assert r["count"] == 3
+        assert r["priority"] == "CRITICAL"
+
+        client.post(f"/api/alerts/{created[-1]}/ack", json={}, headers=h)
+        r = client.get("/api/alerts/unacked/count", headers=h).json()
+        assert r["count"] == 2
+        assert r["priority"] == "IMPORTANT"
+    finally:
+        db = SessionLocal()
+        try:
+            db.query(AlertReceipt).filter(AlertReceipt.alert_id.in_(created)).delete()
+            db.query(Alert).filter(Alert.id.in_(created)).delete()
+            db.commit()
+        finally:
+            db.close()
+
+
+def test_targeted_alert_visibility_and_sender_ack():
+    from app.db.models.models import Alert, AlertReceipt
+    from app.db.session import SessionLocal
+
+    _, sender_h = _user()
+    target, target_h = _user()
+    _, outsider_h = _user()
+    created = []
+    try:
+        a = client.post("/api/alerts", json={
+            "title": "Targeted", "body": "only target", "priority": "URGENT",
+            "target_users": [target]}, headers=sender_h).json()
+        created.append(a["id"])
+
+        # target sees it as unacknowledged
+        assert any(x["id"] == a["id"] for x in client.get("/api/alerts", headers=target_h).json())
+        assert client.get("/api/alerts/unacked/count", headers=target_h).json()["count"] == 1
+
+        # outsider does not see it at all
+        assert not any(x["id"] == a["id"] for x in client.get("/api/alerts", headers=outsider_h).json())
+        assert client.get("/api/alerts/unacked/count", headers=outsider_h).json()["count"] == 0
+
+        # sender sees their own alert but it is already acknowledged for them
+        row = next(x for x in client.get("/api/alerts", headers=sender_h).json() if x["id"] == a["id"])
+        assert row["acked_by_me"] is True
+        assert client.get("/api/alerts/unacked/count", headers=sender_h).json()["count"] == 0
+    finally:
+        db = SessionLocal()
+        try:
+            db.query(AlertReceipt).filter(AlertReceipt.alert_id.in_(created)).delete()
+            db.query(Alert).filter(Alert.id.in_(created)).delete()
+            db.commit()
+        finally:
+            db.close()
+
+
 def test_messages_read_and_graph():
     _, h = _user()
     ch = client.post("/api/messages/channels", json={"name": f"ch_{uuid.uuid4().hex[:6]}", "type": "group"}, headers=h).json()

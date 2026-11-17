@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Link, useSearchParams } from 'react-router-dom'
-import { MoreVertical, Pencil, Plus, Send, Trash2, UserCheck, UserMinus, UserPlus, X } from 'lucide-react'
+import { MoreVertical, LogOut, Pencil, Plus, Send, Trash2, UserCheck, UserMinus, UserPlus, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, useAuth } from '../store/useAuth'
 import { Card } from '../components/ui/card'
@@ -16,6 +16,7 @@ export default function Chat() {
   const { user, token } = useAuth()
   const [params, setParams] = useSearchParams()
   const fileParam = params.get('file') || ''
+  const [isAdmin, setIsAdmin] = useState(false)
 
   const [channels, setChannels] = useState<Ch[]>([])
   const [cid, setCid] = useState<number | null>(null)
@@ -48,6 +49,7 @@ export default function Chat() {
   const [addId, setAddId] = useState<number | null>(null)
   const [addPick, setAddPick] = useState<string[]>([])
   const [removeId, setRemoveId] = useState<number | null>(null)
+  const [leaveId, setLeaveId] = useState<number | null>(null)
   const [del, setDel] = useState<{ id: number; name: string; count: number } | null>(null)
   // Typing indicator: map of username → timeout handle
   const [typingUsers, setTypingUsers] = useState<Record<string, boolean>>({})
@@ -110,6 +112,12 @@ export default function Chat() {
   userRef.current = user
 
   useEffect(() => { loadCh(); loadUsers() }, [])
+  useEffect(() => {
+    api('/api/auth/me', auth)
+      .then(me => setIsAdmin((me?.role || '').toLowerCase() === 'admin'))
+      .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token])
   useEffect(() => { loadMsg() }, [cid, fileFilter])
   useEffect(() => { setFileFilter(fileParam) }, [fileParam])
 
@@ -240,7 +248,7 @@ export default function Chat() {
   const toggleMenu = (c: Ch, e: React.MouseEvent<HTMLButtonElement>) => {
     if (menu?.id === c.id) { setMenu(null); return }
     const r = e.currentTarget.getBoundingClientRect()
-    const MENU_H = 152 // approx height of the 4-item menu
+    const MENU_H = isAdmin ? 190 : 160 // approx height of the menu
     const left = Math.min(Math.max(8, r.right - 176), Math.max(8, window.innerWidth - 184))
     if (window.innerHeight - r.bottom < MENU_H + 8) {
       // no room below the button — pop upward, hugging the button
@@ -276,6 +284,17 @@ export default function Chat() {
       await api(`/api/messages/channels/${removeId}/members`, { ...auth, method: 'POST', body: JSON.stringify({ remove: [member] }) })
       toast.success(`${member} removed`)
       if (channels.find(c => c.id === removeId)?.members.length === 2) setRemoveId(null)
+      loadCh()
+    } catch (e: any) { toast.error(e.message) }
+  }
+
+  const doLeave = async () => {
+    if (leaveId == null) return
+    try {
+      await api(`/api/messages/channels/${leaveId}/members`, { ...auth, method: 'POST', body: JSON.stringify({ remove: [user] }) })
+      toast.success('Left the channel')
+      if (cid === leaveId) { setCid(null); setMsgs([]) }
+      setLeaveId(null); setMenu(null)
       loadCh()
     } catch (e: any) { toast.error(e.message) }
   }
@@ -379,7 +398,10 @@ export default function Chat() {
                 <button onClick={() => { setRename({ id: c.id, name: c.name }); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><Pencil size={13} /> Rename</button>
                 <button onClick={() => { setAddId(c.id); setAddPick([]); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><UserPlus size={13} /> Add person</button>
                 <button onClick={() => { setRemoveId(c.id); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><UserMinus size={13} /> Remove person</button>
-                <button onClick={() => openDelete(c)} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[rgba(239,68,68,0.15)] text-left text-red-400"><Trash2 size={13} /> Delete…</button>
+                <button onClick={() => { setLeaveId(c.id); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><LogOut size={13} /> Leave channel</button>
+                {isAdmin && (
+                  <button onClick={() => openDelete(c)} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[rgba(239,68,68,0.15)] text-left text-red-400"><Trash2 size={13} /> Delete…</button>
+                )}
               </div>
             </>,
             document.body
@@ -495,7 +517,7 @@ export default function Chat() {
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={() => setRemoveId(null)}>
           <div className="w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4" onClick={e => e.stopPropagation()}>
             <h3 className="font-bold mb-1">Remove person</h3>
-            <p className="text-xs text-[var(--muted)] mb-3">You cannot remove yourself — delete the channel instead.</p>
+            <p className="text-xs text-[var(--muted)] mb-3">Use “Leave channel” to exit a conversation yourself.</p>
             <div className="space-y-1 mb-3">
               {(channels.find(c => c.id === removeId)?.members || []).filter(m => m !== user).map(m => (
                 <div key={m} className="flex items-center gap-2 text-sm rounded-lg px-2 py-1.5">
@@ -508,6 +530,19 @@ export default function Chat() {
               )}
             </div>
             <Button variant="secondary" onClick={() => setRemoveId(null)} className="w-full">Done</Button>
+          </div>
+        </div>
+      )}
+
+      {leaveId != null && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={() => setLeaveId(null)}>
+          <div className="w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4" onClick={e => e.stopPropagation()}>
+            <h3 className="font-bold mb-1">Leave “{channels.find(c => c.id === leaveId)?.name}”?</h3>
+            <p className="text-sm text-[var(--muted)] mb-3">You will stop seeing this conversation. Messages are kept for the remaining members.</p>
+            <div className="flex gap-2">
+              <Button variant="secondary" onClick={() => setLeaveId(null)} className="flex-1">Cancel</Button>
+              <Button variant="destructive" onClick={doLeave} className="flex-1">Leave</Button>
+            </div>
           </div>
         </div>
       )}

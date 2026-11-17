@@ -1,5 +1,6 @@
 """Single-root shared files: one 'root' for all users, per-subfolder member ACL."""
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -65,9 +66,11 @@ def get_root(db: Session) -> Path:
 
 
 def _top(rel: str) -> str:
-    """Top-level subfolder of a relative path, '' for root-level files."""
-    rel = (rel or "").strip().lstrip("/")
-    return rel.split("/")[0] if "/" in rel else ""
+    """Top-level folder of a relative path ('' only for the root itself)."""
+    rel = (rel or "").strip().strip("/")
+    if not rel:
+        return ""
+    return rel.split("/")[0]
 
 
 def _safe_rel(path: str) -> str:
@@ -544,6 +547,8 @@ def manifest(path: str, db: Session = Depends(get_db), user=Depends(get_current_
     target = get_root(db) / rel
     if not target.exists():
         return {"exists": False, "chunks": [], "size": 0}
+    if target.is_dir():
+        raise HTTPException(400, "Path is a directory")
     return {"exists": True, "chunks": chunk_file(target), "size": target.stat().st_size,
             "sha256": sha256_file(target)}
 
@@ -683,14 +688,23 @@ def reveal_in_browser(path: str | None = None, db: Session = Depends(get_db),
             raise HTTPException(404, "Not found")
     try:
         if sys.platform == "darwin":
+            # Finder: reveal+select files, open folders directly
             cmd = ["open", "-R", str(target)] if target.is_file() else ["open", str(target)]
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif sys.platform == "win32":
-            cmd = ["explorer", f"/select,{target}"] if target.is_file() else ["explorer", str(target)]
+            # Explorer: /select highlights the file; folders open directly
+            if target.is_file():
+                subprocess.Popen(["explorer", f"/select,{target}"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                os.startfile(str(target))
         else:
-            folder = str(target if target.is_dir() else target.parent)
+            folder = target if target.is_dir() else target.parent
             opener = shutil.which("xdg-open") or shutil.which("gio")
-            cmd = ["xdg-open", folder] if opener and "xdg" in opener else ["gio", "open", folder]
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not opener:
+                raise RuntimeError("no file manager found (install xdg-open or gio)")
+            subprocess.Popen([opener, str(folder)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         raise HTTPException(500, f"Cannot open file browser on server ({e}). Path: {target}")
     return {"ok": True, "path": str(target)}

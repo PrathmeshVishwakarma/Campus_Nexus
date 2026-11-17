@@ -10,14 +10,26 @@ from app.services import event_service
 router = APIRouter(prefix="/api/messages", tags=["messages"])
 
 
-def _require_member(channel: Channel, username: str):
-    if username not in (channel.members or []):
+def _is_admin(user: User) -> bool:
+    return (user.role or "").lower() == "admin"
+
+
+def _require_admin(user: User):
+    if not _is_admin(user):
+        raise HTTPException(403, "Admin only")
+
+
+def _require_member(channel: Channel, user: User):
+    """Admins can act on every channel; everyone else must be a member."""
+    if not _is_admin(user) and user.username not in (channel.members or []):
         raise HTTPException(403, "You are not a member of this channel")
 
 
 @router.get("/channels")
 def channels(db: Session = Depends(get_db), user=Depends(get_current_user)):
     rows = db.query(Channel).all()
+    if not _is_admin(user):
+        rows = [c for c in rows if user.username in (c.members or [])]
     return [{"id": c.id, "name": c.name, "type": c.type, "members": c.members} for c in rows]
 
 
@@ -48,7 +60,7 @@ async def rename_channel(channel_id: int, data: ChannelRename, db: Session = Dep
     c = db.query(Channel).filter(Channel.id == channel_id).first()
     if not c:
         raise HTTPException(404, "Channel not found")
-    _require_member(c, user.username)
+    _require_member(c, user)
     name = (data.name or "").strip()
     if not name:
         raise HTTPException(400, "Name cannot be empty")
@@ -70,11 +82,9 @@ async def update_members(channel_id: int, data: ChannelMembersUpdate, db: Sessio
     c = db.query(Channel).filter(Channel.id == channel_id).first()
     if not c:
         raise HTTPException(404, "Channel not found")
-    _require_member(c, user.username)
+    _require_member(c, user)
     members = list(c.members or [])
     for u in data.remove or []:
-        if u == user.username:
-            raise HTTPException(400, "You cannot remove yourself — delete the channel instead")
         if u in members:
             members.remove(u)
     for u in data.add or []:
@@ -98,7 +108,7 @@ async def delete_channel(channel_id: int, db: Session = Depends(get_db),
     c = db.query(Channel).filter(Channel.id == channel_id).first()
     if not c:
         raise HTTPException(404, "Channel not found")
-    _require_member(c, user.username)
+    _require_admin(user)
     n_msgs = db.query(Message).filter(Message.channel_id == channel_id).count()
     db.query(Message).filter(Message.channel_id == channel_id).delete()
     db.delete(c)
@@ -113,6 +123,10 @@ async def delete_channel(channel_id: int, db: Session = Depends(get_db),
 @router.get("")
 def list_messages(channel_id: int, file_link: str | None = None,
                   db: Session = Depends(get_db), user=Depends(get_current_user)):
+    ch = db.query(Channel).filter(Channel.id == channel_id).first()
+    if not ch:
+        raise HTTPException(404, "Channel not found")
+    _require_member(ch, user)
     q = db.query(Message).filter(Message.channel_id == channel_id)
     if file_link:
         q = q.filter(Message.file_link == file_link)
@@ -126,6 +140,7 @@ async def send(data: MessageCreate, db: Session = Depends(get_db), user=Depends(
     ch = db.query(Channel).filter(Channel.id == data.channel_id).first()
     if not ch:
         raise HTTPException(404, "Channel not found")
+    _require_member(ch, user)
     m = Message(channel_id=data.channel_id, sender=user.username,
                 content=data.content, file_link=data.file_link)
     db.add(m)
@@ -146,6 +161,10 @@ def mark_read(msg_id: int, db: Session = Depends(get_db), user=Depends(get_curre
     m = db.query(Message).filter(Message.id == msg_id).first()
     if not m:
         raise HTTPException(404, "Not found")
+    ch = db.query(Channel).filter(Channel.id == m.channel_id).first()
+    if not ch:
+        raise HTTPException(404, "Channel not found")
+    _require_member(ch, user)
     m.read = True
     db.commit()
     return {"ok": True}
@@ -155,6 +174,10 @@ def mark_read(msg_id: int, db: Session = Depends(get_db), user=Depends(get_curre
 async def typing(channel_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
     """Emit a transient TYPING event — no DB write, just broadcast."""
     from app.api.websockets.events_ws import broadcast_event
+    ch = db.query(Channel).filter(Channel.id == channel_id).first()
+    if not ch:
+        raise HTTPException(404, "Channel not found")
+    _require_member(ch, user)
     await broadcast_event("TYPING", {"actor": user.username,
                                      "resource": f"channel:{channel_id}",
                                      "payload": {"channel_id": channel_id}})
@@ -163,6 +186,10 @@ async def typing(channel_id: int, db: Session = Depends(get_db), user=Depends(ge
 
 @router.get("/unread/count")
 def unread(channel_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    ch = db.query(Channel).filter(Channel.id == channel_id).first()
+    if not ch:
+        raise HTTPException(404, "Channel not found")
+    _require_member(ch, user)
     n = db.query(Message).filter(Message.channel_id == channel_id,
                                  Message.read == False,  # noqa: E712
                                  Message.sender != user.username).count()

@@ -8,7 +8,10 @@ class UserCreate(BaseModel):
     username: str
     email: str
     password: str
-    role: str = "student"
+
+
+class RoleUpdate(BaseModel):
+    role: str
 
 
 class UserOut(BaseModel):
@@ -69,6 +72,17 @@ class AlertCreate(BaseModel):
     body: str
     priority: str = "NORMAL"
     target_scope: str = "all"
+    target_users: list[str] = []
+
+
+class PushKeys(BaseModel):
+    p256dh: str
+    auth: str
+
+
+class PushSubscriptionIn(BaseModel):
+    endpoint: str
+    keys: PushKeys
 
 
 class ShareFolderCreate(BaseModel):

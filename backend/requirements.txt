@@ -12,6 +12,7 @@ python-multipart
 watchdog
 zeroconf
 psutil
+pywebpush
 scikit-learn
 pandas
 numpy

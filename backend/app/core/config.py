@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     shared_folder: str = "../shared/demo_files"
     discovery_port: int = 9999
     chunk_size: int = 1_048_576  # 1MB
+    vapid_subject: str = "mailto:admin@campus.local"
+    vapid_private_key_file: str = ""
 
     class Config:
         env_file = ".env"

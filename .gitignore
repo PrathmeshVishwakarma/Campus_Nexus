@@ -6,3 +6,4 @@ venv/
 node_modules/
 dist/
 pgdata/
+vapid_private.pem

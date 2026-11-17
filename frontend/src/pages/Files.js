@@ -21,6 +21,9 @@ export default function Files() {
     const [folders, setFolders] = useState([]);
     const [rootPath, setRootPath] = useState('');
     const [isAdmin, setIsAdmin] = useState(false);
+    // Finder/Explorer opens on the machine running the server, so only show it
+    // when this browser is actually on that machine (localhost or its hostname).
+    const [canUseFinder, setCanUseFinder] = useState(false);
     const [users, setUsers] = useState([]);
     const [query, setQuery] = useState('');
     const [selected, setSelected] = useState(null);
@@ -49,7 +52,7 @@ export default function Files() {
     const [sharePick, setSharePick] = useState([]);
     const folderInputRef = useRef(null);
     const auth = { headers: { Authorization: `Bearer ${token}` } };
-    const load = async () => {
+    const load = async (silent = false) => {
         try {
             const [t, f, r] = await Promise.all([
                 api('/api/files/tree', auth),
@@ -62,7 +65,8 @@ export default function Files() {
             setExpanded(prev => ({ '': true, ...prev }));
         }
         catch (e) {
-            toast.error(e.message);
+            if (!silent)
+                toast.error(e.message);
         }
     };
     const loadMe = async () => {
@@ -74,7 +78,7 @@ export default function Files() {
         }
         catch { /* optional */ }
     };
-    const loadDetail = async (path) => {
+    const loadDetail = async (path, silent = false) => {
         try {
             const [v, a] = await Promise.all([
                 api(`/api/files/versions?path=${encodeURIComponent(path)}`, auth),
@@ -84,12 +88,124 @@ export default function Files() {
             setActivity(a);
         }
         catch (e) {
-            toast.error(e.message);
+            if (!silent)
+                toast.error(e.message);
         }
     };
     useEffect(() => { load(); loadMe(); }, []);
+    useEffect(() => {
+        const host = location.hostname.toLowerCase();
+        if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]') {
+            setCanUseFinder(true);
+            return;
+        }
+        fetch('/health')
+            .then(r => r.json())
+            .then(h => {
+            const node = String(h?.node || '').toLowerCase();
+            if (node && (host === node || host.split('.')[0] === node.split('.')[0]))
+                setCanUseFinder(true);
+        })
+            .catch(() => { });
+    }, []);
     useEffect(() => { if (selected)
         loadDetail(selected); }, [selected]);
+    // Live refresh: any file/folder/sync event from the backend reloads the
+    // tree and the open detail panel (plus a quiet poll as a socket fallback,
+    // so phones on flaky networks still stay in sync without a manual refresh).
+    const loadRef = useRef(load);
+    loadRef.current = load;
+    const loadDetailRef = useRef(loadDetail);
+    loadDetailRef.current = loadDetail;
+    const selectedRef = useRef(selected);
+    selectedRef.current = selected;
+    useEffect(() => {
+        let alive = true;
+        let ws = null;
+        let retry = 0;
+        let retryTimer = null;
+        let pingTimer = null;
+        let reloadTimer = null;
+        const relevant = (t) => t.startsWith('FILE') || t.startsWith('SYNC') || t.startsWith('FOLDER') ||
+            t.startsWith('ROOT') || t === 'VERSION_CONFLICT';
+        const reload = () => {
+            if (reloadTimer)
+                clearTimeout(reloadTimer);
+            reloadTimer = setTimeout(() => {
+                loadRef.current(true);
+                const sel = selectedRef.current;
+                if (sel)
+                    loadDetailRef.current(sel, true);
+            }, 250);
+        };
+        const onEvent = (raw) => {
+            try {
+                const e = JSON.parse(raw);
+                if (e.event && relevant(e.event))
+                    reload();
+            }
+            catch { /* ignore malformed frames */ }
+        };
+        const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+        const connect = () => {
+            if (!alive)
+                return;
+            try {
+                ws = new WebSocket(`${scheme}://${location.host}/ws/events?token=${token}`);
+            }
+            catch {
+                scheduleRetry();
+                return;
+            }
+            ws.onopen = () => { retry = 0; };
+            ws.onmessage = (m) => { if (alive)
+                onEvent(m.data); };
+            ws.onerror = () => { try {
+                ws?.close();
+            }
+            catch { } };
+            ws.onclose = () => { scheduleRetry(); };
+        };
+        const scheduleRetry = () => {
+            if (!alive)
+                return;
+            if (pingTimer) {
+                clearInterval(pingTimer);
+                pingTimer = null;
+            }
+            retry = Math.min(retry + 1, 5);
+            if (retryTimer)
+                clearTimeout(retryTimer);
+            retryTimer = setTimeout(() => { if (alive)
+                connect(); }, Math.min(1000 * 2 ** retry, 10000));
+        };
+        connect();
+        pingTimer = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                try {
+                    ws.send(JSON.stringify({ action: 'PING' }));
+                }
+                catch { }
+            }
+        }, 25000);
+        const poll = setInterval(() => { if (alive && !document.hidden)
+            reload(); }, 5000);
+        return () => {
+            alive = false;
+            clearInterval(poll);
+            if (pingTimer)
+                clearInterval(pingTimer);
+            if (retryTimer)
+                clearTimeout(retryTimer);
+            if (reloadTimer)
+                clearTimeout(reloadTimer);
+            try {
+                ws?.close();
+            }
+            catch { }
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [token]);
     const matches = (n, q) => {
         if (!q)
             return true;
@@ -382,9 +498,9 @@ export default function Files() {
         const kids = n.children;
         return (_jsxs("div", { children: [depth > 0 && (_jsxs("div", { className: "flex items-center gap-1 group", children: [_jsxs("button", { onClick: () => setExpanded(e => ({ ...e, [key]: !open })), className: "flex-1 flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-sm hover:bg-[var(--card-hover)] transition-colors", style: { paddingLeft: `${depth * 14 + 8}px` }, children: [open ? _jsx(ChevronDown, { size: 14 }) : _jsx(ChevronRight, { size: 14 }), open ? _jsx(FolderOpen, { size: 14, className: "text-[var(--accent)]" }) : _jsx(Folder, { size: 14, className: "text-[var(--accent)]" }), _jsx("span", { className: "font-medium truncate", children: n.name }), n.locked && _jsx(Lock, { size: 12, className: "text-amber-400 shrink-0" }), _jsx("span", { className: "ml-auto text-[11px] text-[var(--muted)]", children: kids.length })] }), isAdmin && (_jsx("button", { onClick: () => openAccess(n.path), title: `Manage access to ${n.name}`, className: "p-1.5 rounded-md text-[var(--muted)] hover:text-[var(--fg)] opacity-0 group-hover:opacity-100 transition-opacity", children: _jsx(Users, { size: 13 }) })), depth === 1 && (_jsx("button", { onClick: () => setConfirmDelete({ path: n.path, isDir: true }), title: `Delete folder ${n.name}`, className: "p-1.5 rounded-md text-[var(--muted)] hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity", children: _jsx(Trash2, { size: 13 }) }))] })), (open || depth === 0) && (_jsx("div", { children: [...kids].sort((a, b) => (isDir(a) === isDir(b) ? a.name.localeCompare(b.name) : isDir(a) ? -1 : 1)).map(c => renderNode(c, depth + 1)) }))] }, key || 'root'));
     };
-    return (_jsxs("div", { className: "mx-auto w-full max-w-7xl px-4 sm:px-6 py-6", children: [_jsxs("div", { className: "flex items-center gap-2 flex-wrap mb-4", children: [_jsxs("div", { className: "min-w-0", children: [_jsxs("h1", { className: "text-xl font-bold tracking-tight", children: ["root ", _jsx("span", { className: "text-[var(--muted)] font-normal text-sm", children: "shared with all" })] }), _jsx("p", { className: "text-xs text-[var(--muted)] truncate", title: rootPath, children: rootPath })] }), _jsxs("div", { className: "ml-auto flex items-center gap-2 flex-wrap", children: [_jsx(Input, { value: query, onChange: e => setQuery(e.target.value), placeholder: "Search files\u2026", "aria-label": "Search files", className: "w-44" }), _jsx(Button, { variant: "secondary", onClick: load, title: "Refresh", children: _jsx(RefreshCw, { size: 15 }) }), _jsx(Button, { variant: "secondary", onClick: () => reveal(), title: "Open shared root in Finder / File Explorer (server machine)", children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(FolderSearch, { size: 14 }), " Finder"] }) }), _jsx(Button, { variant: "secondary", onClick: () => { setUploadDir(selectedDir); setUploadMode('choose'); setUploadNew(''); setShowUpload(true); }, children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(Upload, { size: 14 }), " Upload"] }) }), _jsx(Button, { variant: "secondary", onClick: () => folderInputRef.current?.click(), title: "Upload an entire folder with conflict check + sharing", children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(FolderUp, { size: 14 }), " Folder"] }) }), _jsx("input", { ref: folderInputRef, type: "file", className: "hidden", 
+    return (_jsxs("div", { className: "mx-auto w-full max-w-7xl px-4 sm:px-6 py-6", children: [_jsxs("div", { className: "flex items-center gap-2 flex-wrap mb-4", children: [_jsxs("div", { className: "min-w-0", children: [_jsxs("h1", { className: "text-xl font-bold tracking-tight", children: ["root ", _jsx("span", { className: "text-[var(--muted)] font-normal text-sm", children: "shared with all" })] }), _jsx("p", { className: "text-xs text-[var(--muted)] truncate", title: rootPath, children: rootPath })] }), _jsxs("div", { className: "ml-auto flex items-center gap-2 flex-wrap", children: [_jsx(Input, { value: query, onChange: e => setQuery(e.target.value), placeholder: "Search files\u2026", "aria-label": "Search files", className: "w-44" }), _jsx(Button, { variant: "secondary", onClick: () => load(), title: "Refresh", children: _jsx(RefreshCw, { size: 15 }) }), canUseFinder && (_jsx(Button, { variant: "secondary", onClick: () => reveal(), title: "Open shared root in Finder / File Explorer (server machine)", children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(FolderSearch, { size: 14 }), " Finder"] }) })), _jsx(Button, { variant: "secondary", onClick: () => { setUploadDir(selectedDir); setUploadMode('choose'); setUploadNew(''); setShowUpload(true); }, children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(Upload, { size: 14 }), " Upload"] }) }), _jsx(Button, { variant: "secondary", onClick: () => folderInputRef.current?.click(), title: "Upload an entire folder with conflict check + sharing", children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(FolderUp, { size: 14 }), " Folder"] }) }), _jsx("input", { ref: folderInputRef, type: "file", className: "hidden", 
                                 // @ts-expect-error webkitdirectory is non-standard but supported for folder pick
-                                webkitdirectory: "", onChange: e => onFolderPicked(e.target.files) }), isAdmin && (_jsxs(_Fragment, { children: [_jsx(Button, { variant: "secondary", onClick: () => setShowNewFolder(true), children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(Plus, { size: 14 }), " Folder"] }) }), _jsx(Button, { variant: "secondary", onClick: () => { setNewRoot(rootPath); setShowRoot(true); }, title: "Change root location", children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(Settings2, { size: 14 }), " Root"] }) })] }))] })] }), _jsxs("div", { className: "grid lg:grid-cols-5 gap-4 items-start", children: [_jsxs(Card, { className: "lg:col-span-3 p-3", children: [_jsx("div", { className: "max-h-[64vh] overflow-auto pr-1", children: filteredTree ? renderNode(filteredTree, 0) : _jsx("p", { className: "text-sm text-[var(--muted)] text-center py-8", children: "No files yet \u2014 upload one." }) }), _jsxs("div", { className: "mt-2 flex items-center gap-3 text-[11px] text-[var(--muted)] flex-wrap", children: [_jsxs("span", { className: "flex items-center gap-1", children: [_jsx(Lock, { size: 11, className: "text-amber-400" }), " restricted subfolder"] }), _jsxs("span", { children: [folders.filter(f => f.locked).length, " restricted \u00B7 ", folders.length, " subfolders"] })] })] }), _jsx(Card, { className: "lg:col-span-2", children: !selected ? (_jsx("div", { className: "min-h-[300px] flex items-center justify-center text-sm text-[var(--muted)] text-center p-8", children: "Select a file in the tree to see versions, download, discuss, and audit." })) : (_jsxs("div", { className: "space-y-3", children: [_jsxs("div", { className: "flex items-start gap-2 flex-wrap", children: [_jsxs("div", { className: "min-w-0", children: [_jsx("h2", { className: "font-bold truncate", children: selected.split('/').pop() }), _jsx("p", { className: "text-xs text-[var(--muted)] truncate", children: selected })] }), _jsxs("div", { className: "ml-auto flex gap-2 flex-wrap", children: [_jsx(Button, { variant: "secondary", onClick: () => reveal(selected), title: "Reveal in Finder / File Explorer (server machine)", children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(FolderSearch, { size: 14 }), " Reveal"] }) }), _jsx(Button, { onClick: () => downloadFile(selected), children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(Download, { size: 14 }), " Download"] }) }), _jsx(Link, { to: `/files/discussion?path=${encodeURIComponent(selected)}`, children: _jsx(Button, { variant: "secondary", children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(MessageSquare, { size: 14 }), " Discuss"] }) }) }), _jsx(Button, { variant: "destructive", onClick: () => setConfirmDelete({ path: selected, isDir: false }), title: "Delete this file", children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(Trash2, { size: 14 }), " Delete"] }) })] })] }), _jsxs("div", { className: "flex gap-1 text-sm border-b border-[var(--border)]", children: [_jsxs("button", { onClick: () => setTab('versions'), className: `px-3 py-1.5 flex items-center gap-1.5 ${tab === 'versions' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)] font-medium' : 'text-[var(--muted)]'}`, children: [_jsx(History, { size: 13 }), " Versions"] }), _jsxs("button", { onClick: () => setTab('activity'), className: `px-3 py-1.5 flex items-center gap-1.5 ${tab === 'activity' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)] font-medium' : 'text-[var(--muted)]'}`, children: [_jsx(Activity, { size: 13 }), " Audit"] })] }), tab === 'versions' ? (_jsxs("div", { children: [_jsxs("div", { className: "space-y-2 max-h-64 overflow-auto", children: [versions.map(v => (_jsx("div", { className: "rounded-xl border border-[var(--border)] px-3 py-2 text-xs", children: _jsxs("div", { className: "flex items-center gap-2 flex-wrap", children: [_jsxs("span", { className: "font-bold", children: ["v", v.version] }), _jsx("span", { className: "font-mono text-[var(--muted)]", children: v.hash.slice(0, 12) }), _jsxs("span", { className: "text-[var(--muted)]", children: [v.size, " bytes \u00B7 by ", v.by] }), _jsx("span", { className: "ml-auto text-[var(--muted)]", children: new Date(v.at).toLocaleString() })] }) }, v.version))), versions.length === 0 && _jsx("p", { className: "text-xs text-[var(--muted)]", children: "No versions recorded yet." })] }), _jsxs("div", { className: "flex gap-2 mt-2", children: [_jsx(Button, { variant: "secondary", onClick: () => resolve(selected, 'latest'), children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(ShieldCheck, { size: 14 }), " Keep latest"] }) }), _jsx(Button, { variant: "secondary", onClick: () => resolve(selected, 'keep-mine'), children: "Keep mine" })] })] })) : (_jsxs("div", { className: "space-y-1.5 max-h-64 overflow-auto", children: [activity.map(a => (_jsxs("div", { className: "rounded-lg bg-[var(--card)] px-3 py-1.5 text-xs flex items-center gap-2", children: [_jsx("span", { className: "font-bold text-[var(--accent)]", children: a.type }), _jsx("span", { children: a.actor }), _jsx("span", { className: "ml-auto text-[var(--muted)]", children: new Date(a.timestamp).toLocaleString() })] }, a.id))), activity.length === 0 && _jsx("p", { className: "text-xs text-[var(--muted)]", children: "No audit events for this file yet." })] }))] })) })] }), showUpload && (_jsx("div", { className: "fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4", onClick: () => progress === null && setShowUpload(false), children: _jsxs("div", { className: "w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4", onClick: e => e.stopPropagation(), children: [_jsx("h3", { className: "font-bold mb-1", children: "Upload to root" }), _jsx("p", { className: "text-xs text-[var(--muted)] mb-3", children: "Pick a destination inside the shared root. Access follows the subfolder." }), _jsx("div", { className: "flex gap-2", children: _jsxs("select", { value: uploadMode === 'new' ? '__new__' : uploadDir, onChange: e => { if (e.target.value === '__new__') {
+                                webkitdirectory: "", onChange: e => onFolderPicked(e.target.files) }), isAdmin && (_jsxs(_Fragment, { children: [_jsx(Button, { variant: "secondary", onClick: () => setShowNewFolder(true), children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(Plus, { size: 14 }), " Folder"] }) }), _jsx(Button, { variant: "secondary", onClick: () => { setNewRoot(rootPath); setShowRoot(true); }, title: "Change root location", children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(Settings2, { size: 14 }), " Root"] }) })] }))] })] }), _jsxs("div", { className: "grid lg:grid-cols-5 gap-4 items-start", children: [_jsxs(Card, { className: "lg:col-span-3 p-3", children: [_jsx("div", { className: "max-h-[64vh] overflow-auto pr-1", children: filteredTree ? renderNode(filteredTree, 0) : _jsx("p", { className: "text-sm text-[var(--muted)] text-center py-8", children: "No files yet \u2014 upload one." }) }), _jsxs("div", { className: "mt-2 flex items-center gap-3 text-[11px] text-[var(--muted)] flex-wrap", children: [_jsxs("span", { className: "flex items-center gap-1", children: [_jsx(Lock, { size: 11, className: "text-amber-400" }), " restricted subfolder"] }), _jsxs("span", { children: [folders.filter(f => f.locked).length, " restricted \u00B7 ", folders.length, " subfolders"] })] })] }), _jsx(Card, { className: "lg:col-span-2", children: !selected ? (_jsx("div", { className: "min-h-[300px] flex items-center justify-center text-sm text-[var(--muted)] text-center p-8", children: "Select a file in the tree to see versions, download, discuss, and audit." })) : (_jsxs("div", { className: "space-y-3", children: [_jsxs("div", { className: "flex items-start gap-2 flex-wrap", children: [_jsxs("div", { className: "min-w-0", children: [_jsx("h2", { className: "font-bold truncate", children: selected.split('/').pop() }), _jsx("p", { className: "text-xs text-[var(--muted)] truncate", children: selected })] }), _jsxs("div", { className: "ml-auto flex gap-2 flex-wrap", children: [_jsx(Button, { onClick: () => downloadFile(selected), children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(Download, { size: 14 }), " Download"] }) }), _jsx(Link, { to: `/files/discussion?path=${encodeURIComponent(selected)}`, children: _jsx(Button, { variant: "secondary", children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(MessageSquare, { size: 14 }), " Discuss"] }) }) }), _jsx(Button, { variant: "destructive", onClick: () => setConfirmDelete({ path: selected, isDir: false }), title: "Delete this file", children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(Trash2, { size: 14 }), " Delete"] }) })] })] }), _jsxs("div", { className: "flex gap-1 text-sm border-b border-[var(--border)]", children: [_jsxs("button", { onClick: () => setTab('versions'), className: `px-3 py-1.5 flex items-center gap-1.5 ${tab === 'versions' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)] font-medium' : 'text-[var(--muted)]'}`, children: [_jsx(History, { size: 13 }), " Versions"] }), _jsxs("button", { onClick: () => setTab('activity'), className: `px-3 py-1.5 flex items-center gap-1.5 ${tab === 'activity' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)] font-medium' : 'text-[var(--muted)]'}`, children: [_jsx(Activity, { size: 13 }), " Audit"] })] }), tab === 'versions' ? (_jsxs("div", { children: [_jsxs("div", { className: "space-y-2 max-h-64 overflow-auto", children: [versions.map(v => (_jsx("div", { className: "rounded-xl border border-[var(--border)] px-3 py-2 text-xs", children: _jsxs("div", { className: "flex items-center gap-2 flex-wrap", children: [_jsxs("span", { className: "font-bold", children: ["v", v.version] }), _jsx("span", { className: "font-mono text-[var(--muted)]", children: v.hash.slice(0, 12) }), _jsxs("span", { className: "text-[var(--muted)]", children: [v.size, " bytes \u00B7 by ", v.by] }), _jsx("span", { className: "ml-auto text-[var(--muted)]", children: new Date(v.at).toLocaleString() })] }) }, v.version))), versions.length === 0 && _jsx("p", { className: "text-xs text-[var(--muted)]", children: "No versions recorded yet." })] }), _jsxs("div", { className: "flex gap-2 mt-2", children: [_jsx(Button, { variant: "secondary", onClick: () => resolve(selected, 'latest'), children: _jsxs("span", { className: "flex items-center gap-1.5", children: [_jsx(ShieldCheck, { size: 14 }), " Keep latest"] }) }), _jsx(Button, { variant: "secondary", onClick: () => resolve(selected, 'keep-mine'), children: "Keep mine" })] })] })) : (_jsxs("div", { className: "space-y-1.5 max-h-64 overflow-auto", children: [activity.map(a => (_jsxs("div", { className: "rounded-lg bg-[var(--card)] px-3 py-1.5 text-xs flex items-center gap-2", children: [_jsx("span", { className: "font-bold text-[var(--accent)]", children: a.type }), _jsx("span", { children: a.actor }), _jsx("span", { className: "ml-auto text-[var(--muted)]", children: new Date(a.timestamp).toLocaleString() })] }, a.id))), activity.length === 0 && _jsx("p", { className: "text-xs text-[var(--muted)]", children: "No audit events for this file yet." })] }))] })) })] }), showUpload && (_jsx("div", { className: "fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4", onClick: () => progress === null && setShowUpload(false), children: _jsxs("div", { className: "w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4", onClick: e => e.stopPropagation(), children: [_jsx("h3", { className: "font-bold mb-1", children: "Upload to root" }), _jsx("p", { className: "text-xs text-[var(--muted)] mb-3", children: "Pick a destination inside the shared root. Access follows the subfolder." }), _jsx("div", { className: "flex gap-2", children: _jsxs("select", { value: uploadMode === 'new' ? '__new__' : uploadDir, onChange: e => { if (e.target.value === '__new__') {
                                     setUploadMode('new');
                                 }
                                 else {

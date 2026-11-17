@@ -37,6 +37,9 @@ export default function Files() {
   const [folders, setFolders] = useState<FolderInfo[]>([])
   const [rootPath, setRootPath] = useState('')
   const [isAdmin, setIsAdmin] = useState(false)
+  // Finder/Explorer opens on the machine running the server, so only show it
+  // when this browser is actually on that machine (localhost or its hostname).
+  const [canUseFinder, setCanUseFinder] = useState(false)
   const [users, setUsers] = useState<UserItem[]>([])
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<string | null>(null)
@@ -67,7 +70,7 @@ export default function Files() {
 
   const auth = { headers: { Authorization: `Bearer ${token}` } }
 
-  const load = async () => {
+  const load = async (silent = false) => {
     try {
       const [t, f, r] = await Promise.all([
         api('/api/files/tree', auth),
@@ -76,7 +79,7 @@ export default function Files() {
       ])
       setTree(t); setFolders(f); setRootPath(r.path)
       setExpanded(prev => ({ '': true, ...prev }))
-    } catch (e: any) { toast.error(e.message) }
+    } catch (e: any) { if (!silent) toast.error(e.message) }
   }
 
   const loadMe = async () => {
@@ -88,18 +91,106 @@ export default function Files() {
     } catch { /* optional */ }
   }
 
-  const loadDetail = async (path: string) => {
+  const loadDetail = async (path: string, silent = false) => {
     try {
       const [v, a] = await Promise.all([
         api(`/api/files/versions?path=${encodeURIComponent(path)}`, auth),
         api(`/api/files/activity?path=${encodeURIComponent(path)}`, auth),
       ])
       setVersions(v); setActivity(a)
-    } catch (e: any) { toast.error(e.message) }
+    } catch (e: any) { if (!silent) toast.error(e.message) }
   }
 
   useEffect(() => { load(); loadMe() }, [])
+  useEffect(() => {
+    const host = location.hostname.toLowerCase()
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]') {
+      setCanUseFinder(true)
+      return
+    }
+    fetch('/health')
+      .then(r => r.json())
+      .then(h => {
+        const node = String(h?.node || '').toLowerCase()
+        if (node && (host === node || host.split('.')[0] === node.split('.')[0])) setCanUseFinder(true)
+      })
+      .catch(() => {})
+  }, [])
   useEffect(() => { if (selected) loadDetail(selected) }, [selected])
+
+  // Live refresh: any file/folder/sync event from the backend reloads the
+  // tree and the open detail panel (plus a quiet poll as a socket fallback,
+  // so phones on flaky networks still stay in sync without a manual refresh).
+  const loadRef = useRef(load)
+  loadRef.current = load
+  const loadDetailRef = useRef(loadDetail)
+  loadDetailRef.current = loadDetail
+  const selectedRef = useRef(selected)
+  selectedRef.current = selected
+
+  useEffect(() => {
+    let alive = true
+    let ws: WebSocket | null = null
+    let retry = 0
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+    let pingTimer: ReturnType<typeof setInterval> | null = null
+    let reloadTimer: ReturnType<typeof setTimeout> | null = null
+
+    const relevant = (t: string) =>
+      t.startsWith('FILE') || t.startsWith('SYNC') || t.startsWith('FOLDER') ||
+      t.startsWith('ROOT') || t === 'VERSION_CONFLICT'
+
+    const reload = () => {
+      if (reloadTimer) clearTimeout(reloadTimer)
+      reloadTimer = setTimeout(() => {
+        loadRef.current(true)
+        const sel = selectedRef.current
+        if (sel) loadDetailRef.current(sel, true)
+      }, 250)
+    }
+
+    const onEvent = (raw: string) => {
+      try {
+        const e = JSON.parse(raw)
+        if (e.event && relevant(e.event)) reload()
+      } catch { /* ignore malformed frames */ }
+    }
+
+    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
+    const connect = () => {
+      if (!alive) return
+      try {
+        ws = new WebSocket(`${scheme}://${location.host}/ws/events?token=${token}`)
+      } catch { scheduleRetry(); return }
+      ws.onopen = () => { retry = 0 }
+      ws.onmessage = (m) => { if (alive) onEvent(m.data) }
+      ws.onerror = () => { try { ws?.close() } catch {} }
+      ws.onclose = () => { scheduleRetry() }
+    }
+    const scheduleRetry = () => {
+      if (!alive) return
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
+      retry = Math.min(retry + 1, 5)
+      if (retryTimer) clearTimeout(retryTimer)
+      retryTimer = setTimeout(() => { if (alive) connect() }, Math.min(1000 * 2 ** retry, 10000))
+    }
+    connect()
+    pingTimer = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ action: 'PING' })) } catch {}
+      }
+    }, 25000)
+    const poll = setInterval(() => { if (alive && !document.hidden) reload() }, 5000)
+    return () => {
+      alive = false
+      clearInterval(poll)
+      if (pingTimer) clearInterval(pingTimer)
+      if (retryTimer) clearTimeout(retryTimer)
+      if (reloadTimer) clearTimeout(reloadTimer)
+      try { ws?.close() } catch {}
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token])
 
   const matches = (n: TreeNode, q: string): boolean => {
     if (!q) return true
@@ -376,10 +467,12 @@ export default function Files() {
         </div>
         <div className="ml-auto flex items-center gap-2 flex-wrap">
           <Input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search files…" aria-label="Search files" className="w-44" />
-          <Button variant="secondary" onClick={load} title="Refresh"><RefreshCw size={15} /></Button>
-          <Button variant="secondary" onClick={() => reveal()} title="Open shared root in Finder / File Explorer (server machine)">
-            <span className="flex items-center gap-1.5"><FolderSearch size={14} /> Finder</span>
-          </Button>
+          <Button variant="secondary" onClick={() => load()} title="Refresh"><RefreshCw size={15} /></Button>
+          {canUseFinder && (
+            <Button variant="secondary" onClick={() => reveal()} title="Open shared root in Finder / File Explorer (server machine)">
+              <span className="flex items-center gap-1.5"><FolderSearch size={14} /> Finder</span>
+            </Button>
+          )}
           <Button variant="secondary" onClick={() => { setUploadDir(selectedDir); setUploadMode('choose'); setUploadNew(''); setShowUpload(true) }}>
             <span className="flex items-center gap-1.5"><Upload size={14} /> Upload</span>
           </Button>
@@ -428,7 +521,6 @@ export default function Files() {
                   <p className="text-xs text-[var(--muted)] truncate">{selected}</p>
                 </div>
                 <div className="ml-auto flex gap-2 flex-wrap">
-                  <Button variant="secondary" onClick={() => reveal(selected)} title="Reveal in Finder / File Explorer (server machine)"><span className="flex items-center gap-1.5"><FolderSearch size={14} /> Reveal</span></Button>
                   <Button onClick={() => downloadFile(selected)}><span className="flex items-center gap-1.5"><Download size={14} /> Download</span></Button>
                   <Link to={`/files/discussion?path=${encodeURIComponent(selected)}`}>
                     <Button variant="secondary"><span className="flex items-center gap-1.5"><MessageSquare size={14} /> Discuss</span></Button>

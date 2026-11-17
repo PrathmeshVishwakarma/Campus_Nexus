@@ -6,6 +6,7 @@ from app.db.models.models import (  # noqa: F401
     FileVersion,
     Message,
     Peer,
+    PushSubscription,
     SharedFolder,
     SyncTask,
     User,

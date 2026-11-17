@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import alerts, auth, events, files, messages, peers
+from app.api.routes import alerts, auth, events, files, messages, peers, push
 from app.api.websockets.events_ws import broadcast_event, manager
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
@@ -26,6 +26,7 @@ app.include_router(files.router)
 app.include_router(messages.router)
 app.include_router(alerts.router)
 app.include_router(peers.router)
+app.include_router(push.router)
 
 
 @app.get("/health")
