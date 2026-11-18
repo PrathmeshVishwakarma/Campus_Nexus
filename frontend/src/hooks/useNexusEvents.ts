@@ -13,7 +13,7 @@ import { sessionExpired, useAuth } from '../store/useAuth'
  */
 
 /** notify/sound/toast are computed server-side from the user's notification preferences. */
-export type LiveEvent = { event: string; data: any; notify?: boolean; sound?: boolean; toast?: boolean }
+export type LiveEvent = { event: string; data: any; notify?: boolean; held?: boolean; sound?: boolean; toast?: boolean; badges?: boolean }
 export type ConnStatus = 'connecting' | 'open' | 'closed'
 
 let socket: WebSocket | null = null

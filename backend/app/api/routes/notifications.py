@@ -46,6 +46,7 @@ def _serialize(p: NotificationPreference) -> dict:
         "dnd_end": p.dnd_end or "",
         "sound": p.sound,
         "desktop_toast": p.desktop_toast,
+        "badges": p.badges is not False,
         "email_digest": p.email_digest,
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
@@ -65,6 +66,7 @@ class NotificationSettingsPatch(BaseModel):
     dnd_end: str | None = None
     sound: bool | None = None
     desktop_toast: bool | None = None
+    badges: bool | None = None
     email_digest: bool | None = None
 
 
@@ -79,6 +81,33 @@ def _valid_hhmm(v: str) -> bool:
     except ValueError:
         return False
     return 0 <= h <= 23 and 0 <= m <= 59
+
+
+@router.get("/badges")
+def badges(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Nav badge counts after applying preferences: muted chats and alerts below
+    the minimum priority don't count; badges=false or notifications off -> zeros."""
+    from app.api.routes.alerts import unacked_count
+    from app.api.routes.messages import _unread_counts, muted_channel_ids
+    from app.db.models.models import Channel
+    pref = _get_or_create(db, user.id)
+    if not pref.enabled or pref.badges is False:
+        return {"chat": 0, "alerts": 0, "alert_priority": None, "enabled": False}
+    chat = 0
+    if pref.enable_messages:
+        mine = [c.id for c in db.query(Channel).all() if user.username in (c.members or [])]
+        muted = muted_channel_ids(db, user)
+        chat = sum(n for cid, n in _unread_counts(db, user.username, mine).items() if cid not in muted)
+    al = unacked_count(db, user)
+    return {"chat": chat, "alerts": al["count"], "alert_priority": al["priority"], "enabled": True}
+
+
+@router.get("/dnd")
+def dnd(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Is the user inside their do-not-disturb window right now (server time)?"""
+    from app.services.notify import in_dnd
+    pref = _get_or_create(db, user.id)
+    return {"active": bool(pref.enabled and in_dnd(pref)), "start": pref.dnd_start, "end": pref.dnd_end}
 
 
 @router.get("/settings")

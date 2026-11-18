@@ -11,6 +11,7 @@ from app.db.models.models import (  # noqa: F401
     MessageRead,
     NotificationPreference,
     Peer,
+    PushSubscription,
     RootConfig,
     SyncTask,
     User,

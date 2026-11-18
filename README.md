@@ -17,10 +17,10 @@ Node agents — folder poll · chunked sync with conflict detection · UDP disco
 | Area | Features |
 |------|----------|
 | Dashboard | Live event timeline (only events you may see) with search, stat tiles, quick links |
-| Files | One shared root with per-subfolder member ACLs, 1 MB chunked upload with SHA-256 chunk dedup, atomic commit, full version history with **restorable content**, conflict detection from the version an edit was based on, per-file discussions |
-| Chat | Groups + 1:1 DMs (one per pair), members-only access, per-user read receipts and unread counts, typing indicator, file threads (`/chat?file=<path>`) |
-| Alerts | 5 priorities (CRITICAL/URGENT need faculty, staff or admin), target everyone / roles / named people, ACK tracking + delivery receipts, learned ranking |
-| Notifications | Per-user preferences (categories, minimum alert priority, muted chats/folders, do-not-disturb, sound/toast) applied to every live event |
+| Files | One shared root with per-subfolder member ACLs (members can be view-only), live tree updates, 1 MB chunked upload with SHA-256 chunk dedup, atomic commit, full version history with **restorable content**, conflict detection from the version an edit was based on, per-file discussion tab in the file panel |
+| Chat | Groups + 1:1 DMs (one per pair), members-only access, instant (optimistic) send, per-user read receipts and unread counts, typing indicator, leave group |
+| Alerts | 5 priorities (CRITICAL/URGENT need faculty, staff or admin), target everyone / roles / named people, live list + ACK receipts, learned ranking, **Web Push** to devices with the site closed |
+| Notifications | Per-user preferences (categories, minimum alert priority, muted chats/folders, do-not-disturb with a summary afterwards, sound/toast/badges) applied to live events, push, nav badges and Smart rank |
 | Network | Peer topology graph, scheduler queue viewer, bandwidth/congestion state, anomaly status |
 | ML safety | Time-bucketed burst detection (hard rule + IsolationForest with a magnitude gate) → auto-pause sync + banner; an admin reviews and resumes |
 | Agent | Stdlib-only poller: heartbeat, change detect, chunked upload, remembers base versions for conflict detection |
@@ -63,7 +63,8 @@ Settings live in `backend/.env` (see [`backend/.env.example`](backend/.env.examp
 3. Each registers + logs in, then Chat → New → Group or 1:1 DM → send. Messages, typing and read
    receipts arrive live over the WebSocket.
 
-On plain-`http` LAN addresses browsers disable `crypto.subtle`, so uploads skip chunk dedup there
+Web Push and system notifications need HTTPS (or `localhost`); the VAPID key pair is generated on
+first use in `backend/data/vapid_private.pem`. On plain-`http` LAN addresses browsers also disable `crypto.subtle`, so uploads skip chunk dedup there
 (they still work). Use `localhost` or HTTPS to get dedup.
 
 ## Docker (Postgres + backend + frontend)
@@ -86,7 +87,8 @@ per-process state.
 `GET /api/sync/manifest` · `POST /api/sync/chunk?path=&index=&total=&upload_id=` · `POST /api/sync/complete?path=&upload_id=` body `{size, base_version}`
 `GET|POST /api/messages/channels` · `GET|POST /api/messages` · `POST /api/messages/read?channel_id=` · `POST /api/messages/typing`
 `GET|POST /api/alerts` · `GET /api/alerts/ranked` · `POST /api/alerts/{id}/ack` · `GET /api/alerts/{id}/receipts`
-`GET|PATCH /api/notifications/settings`
+`GET|PATCH /api/notifications/settings` · `GET /api/notifications/badges|dnd` · `GET /api/alerts/unacked/count`
+`GET /api/push/public-key` · `POST|DELETE /api/push/subscribe`
 `GET /api/peers` · `POST /api/peers/heartbeat|discover` · `GET /api/network/graph|stats` · `GET /api/ml/anomalies`
 `POST /api/sync/report-activity` (admin drill) · `POST /api/sync/resume-scheduler` (admin) · `WS /ws/events?token=<jwt>`
 
@@ -101,7 +103,7 @@ cd ../frontend && npm run typecheck
 
 1. Register the first account (admin) and a second one → Dashboard (live stats + search).
 2. Files → upload → versions + SHA → upload again from an older base → conflict → restore a version.
-3. Chat → New group/DM → send → unread badge + "Read by …" receipts → file thread via "Open in Chat".
+3. Chat → New group/DM → send → unread badge + "Read by …" receipts; Files → a file → Discussion tab.
 4. Alerts → CRITICAL alert (admin) to everyone or a role → ACK → receipts + latency → Smart rank.
 5. As admin: `POST /api/sync/report-activity?n_modified=5000` → anomaly banner → Review & Resume.
 6. Network → topology + scheduler heap + congestion state.

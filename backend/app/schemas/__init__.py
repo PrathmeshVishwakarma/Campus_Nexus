@@ -108,6 +108,8 @@ class AlertCreate(BaseModel):
     body: str = Field(default="", max_length=8000)
     priority: str = "NORMAL"
     target_scope: str = "all"
+    # Alternative to target_scope="users:a,b" (kept for older clients)
+    target_users: list[str] = []
 
     @field_validator("priority")
     @classmethod
@@ -118,17 +120,36 @@ class AlertCreate(BaseModel):
         return v
 
 
+class PushKeys(BaseModel):
+    p256dh: str = Field(max_length=256)
+    auth: str = Field(max_length=128)
+
+
+class PushSubscriptionIn(BaseModel):
+    endpoint: str = Field(max_length=1024)
+    keys: PushKeys
+
+    @field_validator("endpoint")
+    @classmethod
+    def _https(cls, v: str) -> str:
+        if not v.startswith("https://"):
+            raise ValueError("push endpoint must be an https URL")
+        return v
+
+
 class RootUpdate(BaseModel):
     path: str
 
 
 class FolderACLUpdate(BaseModel):
     members: list[str] = []
+    viewers: list[str] = []          # subset of members limited to view/download
 
 
 class FolderMembersUpdate(BaseModel):
     add: list[str] = []
     remove: list[str] = []
+    view_only: Optional[list[str]] = None   # when given, replaces the view-only set
 
 
 class FileCommentCreate(BaseModel):

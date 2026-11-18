@@ -79,6 +79,28 @@ def _require_access(db: Session, user: User, rel: str, acl: dict | None = None):
         raise HTTPException(403, f"No access to '{top_folder(rel)}'")
 
 
+def _viewers_map(db: Session) -> dict[str, set]:
+    return {r.subfolder: set(r.viewers or []) for r in db.query(FolderACL).all()}
+
+
+def can_write(acl: dict, viewers: dict, username: str, admin: bool, rel: str) -> bool:
+    """Readable and not a view-only member of the (locked) top folder."""
+    if not can_access(acl, username, admin, rel):
+        return False
+    return admin or username not in viewers.get(top_folder(rel), set())
+
+
+def _require_write(db: Session, user: User, rel: str):
+    acl = _acl_map(db)
+    _require_access(db, user, rel, acl)
+    if not can_write(acl, _viewers_map(db), user.username, is_admin(user), rel):
+        raise HTTPException(403, f"View-only access to '{top_folder(rel)}'")
+
+
+def _clean_viewers(viewers, members: list) -> list:
+    return [v for v in dict.fromkeys(viewers or []) if v in members]
+
+
 def _target(db: Session, path: str) -> tuple[str, Path, Path]:
     rel = normalize_rel(path)
     root = get_root(db)
@@ -218,6 +240,7 @@ def list_folders(db: Session = Depends(get_db), user=Depends(get_current_user)):
     root = get_root(db)
     admin = is_admin(user)
     acls = _acl_map(db)
+    viewers = _viewers_map(db)
     seen = {p.name for p in root.iterdir() if p.is_dir()} | set(acls.keys())
     out = []
     for sub in sorted(seen):
@@ -226,7 +249,9 @@ def list_folders(db: Session = Depends(get_db), user=Depends(get_current_user)):
         if locked and not admin and user.username not in members:
             continue
         n_files = sum(1 for p in (root / sub).rglob("*") if p.is_file()) if (root / sub).exists() else 0
-        out.append({"name": sub, "path": sub, "members": members or [], "locked": locked, "files": n_files})
+        out.append({"name": sub, "path": sub, "members": members or [], "locked": locked, "files": n_files,
+                    "viewers": sorted(viewers.get(sub, set())),
+                    "can_edit": admin or user.username not in viewers.get(sub, set())})
     return out
 
 
@@ -260,14 +285,17 @@ async def upsert_folder_acl(data: FolderACLUpdate, subfolder: str,
             raise HTTPException(400, f"User '{m}' does not exist")
     if not admin and user.username not in members:
         members.append(user.username)       # never lock yourself out of your own folder
+    viewers = [v for v in _clean_viewers(data.viewers, members) if v != user.username or admin]
     if not existing:
-        db.add(FolderACL(subfolder=sub, members=members, updated_by=user.username))
+        db.add(FolderACL(subfolder=sub, members=members, viewers=viewers, updated_by=user.username))
     else:
-        existing.members, existing.updated_by, existing.updated_at = members, user.username, utcnow()
+        existing.members, existing.viewers = members, viewers
+        existing.updated_by, existing.updated_at = user.username, utcnow()
     db.commit()
     await event_service.emit_event(db, EventCreate(type="FOLDER_ACL_UPDATED", actor=user.username,
-                                                   resource=sub, priority=60, payload={"members": members}))
-    return {"ok": True, "subfolder": sub, "members": members, "locked": True}
+                                                   resource=sub, priority=60,
+                                                   payload={"members": members, "viewers": viewers}))
+    return {"ok": True, "subfolder": sub, "members": members, "viewers": viewers, "locked": True}
 
 
 @router.post("/files/folders/{subfolder}/members")
@@ -289,14 +317,17 @@ async def update_folder_members(subfolder: str, data: FolderMembersUpdate,
             db.delete(row)
             db.commit()
         return {"ok": True, "subfolder": sub, "members": [], "locked": False}
+    current = list(row.viewers or []) if row else []
+    viewers = _clean_viewers(data.view_only if data.view_only is not None else current, members)
     if not row:
-        db.add(FolderACL(subfolder=sub, members=members, updated_by=user.username))
+        db.add(FolderACL(subfolder=sub, members=members, viewers=viewers, updated_by=user.username))
     else:
-        row.members, row.updated_by, row.updated_at = members, user.username, utcnow()
+        row.members, row.viewers, row.updated_by, row.updated_at = members, viewers, user.username, utcnow()
     db.commit()
     await event_service.emit_event(db, EventCreate(type="FOLDER_ACL_UPDATED", actor=user.username,
-                                                   resource=sub, priority=60, payload={"members": members}))
-    return {"ok": True, "subfolder": sub, "members": members, "locked": True}
+                                                   resource=sub, priority=60,
+                                                   payload={"members": members, "viewers": viewers}))
+    return {"ok": True, "subfolder": sub, "members": members, "viewers": viewers, "locked": True}
 
 
 @router.delete("/files/folders/{subfolder}")
@@ -316,6 +347,7 @@ def folder_diff(data: FolderDiffRequest, db: Session = Depends(get_db), user=Dep
     root = get_root(db)
     admin = is_admin(user)
     acl = _acl_map(db)
+    viewers = _viewers_map(db)
     out = []
     for f in data.files or []:
         try:
@@ -324,7 +356,7 @@ def folder_diff(data: FolderDiffRequest, db: Session = Depends(get_db), user=Dep
         except HTTPException:
             out.append({"path": f.path, "status": "invalid", "server_size": 0})
             continue
-        if not can_access(acl, user.username, admin, rel):
+        if not can_write(acl, viewers, user.username, admin, rel):
             out.append({"path": rel, "status": "forbidden", "server_size": 0})
             continue
         if not target.is_file():
@@ -355,7 +387,7 @@ async def delete_item(path: str, db: Session = Depends(get_db), user=Depends(get
     """Delete a file or a top-level subfolder. Keeps audit events."""
     rel, root, target = _target(db, path)
     acl = _acl_map(db)
-    _require_access(db, user, rel, acl)
+    _require_write(db, user, rel)
     if not target.exists():
         raise HTTPException(404, "Not found")
     admin = is_admin(user)
@@ -411,6 +443,7 @@ def get_tree(db: Session = Depends(get_db), user=Depends(get_current_user)):
     root = get_root(db)
     admin = is_admin(user)
     acls = _acl_map(db)
+    viewers_all = _viewers_map(db)
     latest = _latest_versions(db)
 
     def visible_sub(sub: str) -> bool:
@@ -421,7 +454,9 @@ def get_tree(db: Session = Depends(get_db), user=Depends(get_current_user)):
     for sub in sorted(acls):
         if not visible_sub(sub):
             continue
-        node = {"name": sub, "path": sub, "type": "dir", "locked": True, "members": acls[sub], "children": []}
+        vw = viewers_all.get(sub, set())
+        node = {"name": sub, "path": sub, "type": "dir", "locked": True, "members": acls[sub],
+                "viewers": sorted(vw), "can_edit": admin or user.username not in vw, "children": []}
         tree["children"].append(node)
         dirs[sub] = node
     for p in sorted(root.rglob("*")):
@@ -562,7 +597,7 @@ async def upload_chunk(file: UploadFile, path: str, index: int = Query(0, ge=0),
                        db: Session = Depends(get_db), user=Depends(get_current_user)):
     """Stage one chunk at its offset. Nothing reaches the root until /sync/complete."""
     rel, _, target = _target(db, path)
-    _require_access(db, user, rel)
+    _require_write(db, user, rel)
     _ensure_sync_running()
     if index >= total:
         raise HTTPException(400, "index must be < total")
@@ -583,7 +618,7 @@ async def sync_complete(path: str, body: SyncComplete | None = Body(default=None
                         db: Session = Depends(get_db), user=Depends(get_current_user)):
     """Finalize an upload: assemble, version, detect conflicts, store the blob."""
     rel, _, target = _target(db, path)
-    _require_access(db, user, rel)
+    _require_write(db, user, rel)
     _ensure_sync_running()
     body = body or SyncComplete()
     stage = staging_path(user.username, rel, upload_id)
@@ -736,7 +771,7 @@ async def resolve_conflict(path: str, strategy: str = "latest", version: int | N
     A restore writes the chosen bytes back and commits them as a new version.
     """
     rel, _, target = _target(db, path)
-    _require_access(db, user, rel)
+    _require_write(db, user, rel)
     _ensure_sync_running()
     rows = db.query(FileVersion).filter(FileVersion.file_path == rel).order_by(
         FileVersion.version.desc()).all()

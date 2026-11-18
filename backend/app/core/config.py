@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     # Comma-separated usernames that are always admins (promoted on startup/registration).
     admin_usernames: str = ""
+    # Web Push (VAPID). The key pair is generated on first use and kept in
+    # data_dir/vapid_private.pem unless a path is given.
+    vapid_subject: str = "mailto:admin@campus.local"
+    vapid_private_key_file: str = ""
 
     @property
     def cors_origin_list(self) -> list[str]:

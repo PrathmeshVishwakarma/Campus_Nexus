@@ -12,6 +12,7 @@ python-multipart==0.0.20
 watchdog==6.0.0
 zeroconf==0.151.3
 psutil==7.0.0
+pywebpush==2.0.3
 scikit-learn==1.6.1
 numpy==2.2.1
 

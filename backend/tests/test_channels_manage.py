@@ -18,9 +18,10 @@ def test_channel_rename_unique_add_remove_delete(client, user):
     r = client.post(f"/api/messages/channels/{a['id']}/members", json={"add": ["no_such_user"]}, headers=h)
     assert r.status_code == 400
 
+    # removing yourself = leaving; as the last member that deletes the group
     me = client.get("/api/auth/me", headers=h).json()["username"]
     r = client.post(f"/api/messages/channels/{a['id']}/members", json={"remove": [me]}, headers=h)
-    assert r.status_code == 400
+    assert r.status_code == 200 and r.json().get("deleted") is True
 
     client.post("/api/messages", json={"channel_id": b["id"], "content": "bye"}, headers=h)
     r = client.delete(f"/api/messages/channels/{b['id']}", headers=h)

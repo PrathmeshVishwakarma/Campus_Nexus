@@ -14,3 +14,4 @@ dist/
 frontend/src/**/*.js
 .DS_Store
 .nexus_agent_state.json
+vapid_private.pem

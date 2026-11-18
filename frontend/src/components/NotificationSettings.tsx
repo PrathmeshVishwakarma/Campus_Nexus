@@ -8,7 +8,7 @@ import { Input } from './ui/input'
 type Prefs = {
   enabled: boolean; enable_messages: boolean; enable_file_events: boolean; enable_alerts: boolean
   min_alert_priority: string; mute_channel_ids: number[]; mute_folder_paths: string[]
-  dnd_start: string; dnd_end: string; sound: boolean; desktop_toast: boolean
+  dnd_start: string; dnd_end: string; sound: boolean; desktop_toast: boolean; badges: boolean
 }
 
 const PRIOS = ['INFO', 'NORMAL', 'IMPORTANT', 'URGENT', 'CRITICAL']
@@ -28,11 +28,12 @@ export function NotificationSettings({ onClose }: { onClose: () => void }) {
     if (!p) return
     try {
       const { enabled, enable_messages, enable_file_events, enable_alerts, min_alert_priority,
-        mute_channel_ids, mute_folder_paths, dnd_start, dnd_end, sound, desktop_toast } = p
+        mute_channel_ids, mute_folder_paths, dnd_start, dnd_end, sound, desktop_toast, badges } = p
       setP(await api('/api/notifications/settings', { method: 'PATCH', body: JSON.stringify({
         enabled, enable_messages, enable_file_events, enable_alerts, min_alert_priority,
-        mute_channel_ids, mute_folder_paths, dnd_start, dnd_end, sound, desktop_toast }) }))
+        mute_channel_ids, mute_folder_paths, dnd_start, dnd_end, sound, desktop_toast, badges }) }))
       toast.success('Notification settings saved')
+      window.dispatchEvent(new Event('nexus:prefs-changed'))
       onClose()
     } catch (e: any) { toast.error(e.message) }
   }
@@ -69,8 +70,9 @@ export function NotificationSettings({ onClose }: { onClose: () => void }) {
               <Check k="enable_file_events" label="File comments, conflicts and sync alerts" />
               <Check k="desktop_toast" label="Show pop-up toasts" />
               <Check k="sound" label="Play a sound" />
+              <Check k="badges" label="Show unread counts on Chat and Alerts" />
               <div className="text-sm">
-                <div className="mb-1">Do not disturb (server time; CRITICAL alerts still come through)</div>
+                <div className="mb-1">Do not disturb (server time; CRITICAL alerts still come through, the rest is summarised afterwards)</div>
                 <div className="flex items-center gap-2">
                   <Input type="time" value={p.dnd_start} onChange={e => setP({ ...p, dnd_start: e.target.value })} aria-label="DND start" />
                   to

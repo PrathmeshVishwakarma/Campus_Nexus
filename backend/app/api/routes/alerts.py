@@ -1,13 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.routes.auth import get_current_user, is_admin
 from app.core.security import ROLES
 from app.core.timeutil import utcnow
-from app.db.models.models import Alert, AlertReceipt, User
+from app.db.models.models import Alert, AlertReceipt, NotificationPreference, User
 from app.db.session import get_db
 from app.schemas import PRIORITY_MAP, AlertCreate, EventCreate
-from app.services import event_service, scheduler
+from app.services import event_service, push_service, scheduler
+from app.services.notify import alert_wanted, decide, load_prefs
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
@@ -82,11 +83,15 @@ async def do_ack(db: Session, alert_id: str, user: User) -> AlertReceipt:
 
 
 @router.post("")
-async def create_alert(data: AlertCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
+async def create_alert(data: AlertCreate, background: BackgroundTasks, db: Session = Depends(get_db),
+                       user=Depends(get_current_user)):
     prio = data.priority
     if prio in HIGH_PRIORITY and (user.role or "").lower() not in HIGH_PRIORITY_ROLES:
         raise HTTPException(403, f"Only {sorted(HIGH_PRIORITY_ROLES)} may send {prio} alerts")
-    scope, recipients = resolve_targets(db, data.target_scope, user.username)
+    requested = data.target_scope
+    if data.target_users:                    # older clients send a user list instead of a scope
+        requested = "users:" + ",".join(dict.fromkeys(u.strip() for u in data.target_users if u.strip()))
+    scope, recipients = resolve_targets(db, requested, user.username)
     a = Alert(title=data.title, body=data.body, priority=prio, sender=user.username, target_scope=scope)
     db.add(a)
     db.commit()
@@ -101,6 +106,15 @@ async def create_alert(data: AlertCreate, db: Session = Depends(get_db), user=De
     await event_service.emit_event(db, EventCreate(
         type="ALERT_CREATED", actor=user.username, resource=a.id, priority=PRIORITY_MAP.get(prio, 40),
         payload={"title": a.title, "priority": prio, "scope": scope, "recipients": len(recipients)}))
+    # Web Push for devices with the site closed — same rules as live toasts
+    # (preferences, min priority, do-not-disturb except CRITICAL).
+    prefs = load_prefs(db, set(recipients))
+    push_to = [u for u in recipients
+               if decide(prefs.get(u), "ALERT_CREATED", user.username, u, a.id, {"priority": prio}) == "notify"]
+    if push_to:
+        background.add_task(push_service.send_alert_push, push_to, {
+            "id": a.id, "title": f"{prio}: {a.title}", "body": a.body or f"from {user.username}",
+            "priority": prio, "url": "/alerts"})
     return {"id": a.id, "title": a.title, "body": a.body, "priority": a.priority, "sender": a.sender,
             "target_scope": scope, "created_at": a.created_at.isoformat()}
 
@@ -125,10 +139,41 @@ def list_alerts(priority: str | None = None, db: Session = Depends(get_db), user
     return out
 
 
+def _pref(db: Session, user: User) -> NotificationPreference | None:
+    return db.query(NotificationPreference).filter(NotificationPreference.user_id == user.id).first()
+
+
 @router.get("/ranked")
 def ranked(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Smart rank. Alerts below the user's minimum priority sink to the bottom."""
     from app.ml.ranker import rank_alerts
-    return rank_alerts(db, user.username, visible_alerts(db, user))
+    alerts = visible_alerts(db, user)
+    out = rank_alerts(db, user.username, alerts)
+    pref = _pref(db, user)
+    ids = [a.id for a in alerts]
+    counts: dict[str, list] = {}
+    if ids:
+        for r in db.query(AlertReceipt).filter(AlertReceipt.alert_id.in_(ids)).all():
+            counts.setdefault(r.alert_id, []).append(r)
+    for item in out:
+        rs = counts.get(item["id"], [])
+        item["acked"] = sum(1 for r in rs if r.acked_at)
+        item["total"] = len(rs)
+        item["below_threshold"] = not alert_wanted(pref, item["priority"])
+    out.sort(key=lambda i: (i["acked_by_me"], i["below_threshold"]))   # stable: keeps score order
+    return out
+
+
+@router.get("/unacked/count")
+def unacked_count(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Alerts sent to this user that they haven't acknowledged (respecting their
+    minimum-priority preference), plus the highest priority among them."""
+    pref = _pref(db, user)
+    rows = (db.query(Alert.priority).join(AlertReceipt, AlertReceipt.alert_id == Alert.id)
+            .filter(AlertReceipt.user == user.username, AlertReceipt.acked_at.is_(None)).all())
+    prios = [p for (p,) in rows if alert_wanted(pref, p)]
+    top = max(prios, key=lambda p: PRIORITY_MAP.get(p, 0)) if prios else None
+    return {"count": len(prios), "priority": top}
 
 
 @router.post("/{alert_id}/ack")

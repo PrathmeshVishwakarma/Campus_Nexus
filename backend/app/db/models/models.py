@@ -49,6 +49,8 @@ class FolderACL(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     subfolder: Mapped[str] = mapped_column(String(512), unique=True, index=True)
     members: Mapped[list] = mapped_column(JSON, default=list)
+    # members who may only view/download (no upload, delete or restore)
+    viewers: Mapped[list] = mapped_column(JSON, default=list)
     updated_by: Mapped[str] = mapped_column(String(64), default="system")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -156,6 +158,17 @@ class AlertReceipt(Base):
     latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
 
 
+class PushSubscription(Base):
+    """Web Push subscription (one row per browser/device) for background alerts."""
+    __tablename__ = "push_subscriptions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), index=True)
+    endpoint: Mapped[str] = mapped_column(String(1024), unique=True)
+    p256dh: Mapped[str] = mapped_column(String(256))
+    auth: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class Peer(Base):
     __tablename__ = "peers"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -192,5 +205,6 @@ class NotificationPreference(Base):
     dnd_end: Mapped[str] = mapped_column(String(5), default="")
     sound: Mapped[bool] = mapped_column(Boolean, default=True)
     desktop_toast: Mapped[bool] = mapped_column(Boolean, default=True)
+    badges: Mapped[bool] = mapped_column(Boolean, default=True)          # unread/un-acked counts in the nav
     email_digest: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

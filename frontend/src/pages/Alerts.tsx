@@ -1,14 +1,15 @@
-import React, { useEffect, useState } from 'react'
-import { Bell, CheckCheck } from 'lucide-react'
+import React, { useEffect, useRef, useState } from 'react'
+import { Bell, CheckCheck, ChevronDown } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, useAuth } from '../store/useAuth'
+import { useNexusEvents } from '../hooks/useNexusEvents'
 import { Card } from '../components/ui/card'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 
 type AlertItem = {
   id: string; title: string; body: string; priority: string; sender: string;
-  created_at: string; acked: number; total: number; acked_by_me: boolean; score?: number; target_scope?: string; method?: string;
+  created_at: string; acked: number; total: number; acked_by_me: boolean; score?: number; target_scope?: string; method?: string; below_threshold?: boolean;
 }
 type Receipt = { user: string; delivered_at: string; acked_at: string | null; latency_ms: number | null }
 
@@ -26,7 +27,7 @@ const tabColor: Record<string, string> = {
 }
 
 export default function Alerts() {
-  const { token, role } = useAuth()
+  const { token, role, user } = useAuth()
   // CRITICAL / URGENT are reserved for staff, faculty and admins (enforced server-side)
   const canHigh = ['admin', 'faculty', 'staff'].includes(role)
   const allowed = (['CRITICAL', 'URGENT', 'IMPORTANT', 'NORMAL', 'INFO'] as const)
@@ -41,29 +42,35 @@ export default function Alerts() {
   const [filter, setFilter] = useState<PriorityFilter>('ALL')
   const [ranked, setRanked] = useState(false)
   const [receipts, setReceipts] = useState<Record<string, Receipt[]>>({})
+  const [openReceipts, setOpenReceipts] = useState<Record<string, boolean>>({})
 
   const auth = { headers: { Authorization: `Bearer ${token}` } }
 
-  const load = async () => {
+  // reloads keep the current view (filtered list or smart rank)
+  const load = async (silent = false, rankedView = ranked) => {
     try {
-      const res = filter !== 'ALL'
-        ? await api(`/api/alerts?priority=${filter}`, auth)
-        : await api('/api/alerts', auth)
+      const res = rankedView
+        ? await api('/api/alerts/ranked', auth)
+        : filter !== 'ALL' ? await api(`/api/alerts?priority=${filter}`, auth) : await api('/api/alerts', auth)
       setAlerts(res)
-      setRanked(false)
-    } catch (e: any) { toast.error(e.message) }
+    } catch (e: any) { if (!silent) toast.error(e.message) }
   }
 
-  useEffect(() => { load() }, [])
-  useEffect(() => { load() }, [filter])
+  useEffect(() => { setRanked(false); load(false, false) }, [filter])
 
-  // Auto-load receipts for CRITICAL alerts
-  useEffect(() => {
-    const criticals = alerts.filter(a => a.priority === 'CRITICAL')
-    criticals.forEach(a => {
-      if (!receipts[a.id]) showReceipts(a.id)
-    })
-  }, [alerts])
+  // Live: new alerts and ACKs (from anyone) update the list and open receipts.
+  const loadRef = useRef(load); loadRef.current = load
+  const openRef = useRef(openReceipts); openRef.current = openReceipts
+  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const { connected } = useNexusEvents((e) => {
+    if (e.event !== 'ALERT_CREATED' && e.event !== 'ALERT_ACKNOWLEDGED') return
+    if (reloadTimer.current) clearTimeout(reloadTimer.current)
+    reloadTimer.current = setTimeout(() => {
+      loadRef.current(true)
+      Object.keys(openRef.current).filter(id => openRef.current[id]).forEach(id => fetchReceipts(id))
+    }, 250)
+  }, token)
+  useEffect(() => { if (connected) loadRef.current(true) }, [connected])   // catch up after reconnect
 
   const create = async () => {
     if (!form.title.trim()) return toast.error('Title required')
@@ -79,14 +86,14 @@ export default function Alerts() {
       await api('/api/alerts', { ...auth, method: 'POST', body: JSON.stringify({ ...form, target_scope }) })
       setForm({ title: '', body: '', priority: 'IMPORTANT' })
       toast.success(target_scope === 'all' ? 'Alert broadcast to everyone' : `Alert sent to ${target_scope}`)
-      load()
+      setScopeUsers([]); setScopeRoles([]); setScopeKind('all')
     } catch (e: any) { toast.error(e.message) }
   }
 
   const loadRanked = async () => {
     try {
-      setAlerts(await api('/api/alerts/ranked', auth))
       setRanked(true)
+      setAlerts(await api('/api/alerts/ranked', auth))
     } catch (e: any) { toast.error(e.message) }
   }
 
@@ -94,15 +101,20 @@ export default function Alerts() {
     try {
       const res = await api(`/api/alerts/${id}/ack`, { ...auth, method: 'POST', body: JSON.stringify({}) })
       toast.success(`Acknowledged (${res.latency_ms} ms)`)
-      load()
+      setAlerts(list => list.map(a => a.id === id ? { ...a, acked_by_me: true, acked: a.acked + 1 } : a))
     } catch (e: any) { toast.error(e.message) }
   }
 
-  const showReceipts = async (id: string) => {
+  const fetchReceipts = async (id: string) => {
     try {
       const rows = await api(`/api/alerts/${id}/receipts`, auth)
       setReceipts(r => ({ ...r, [id]: rows }))
     } catch (e: any) { toast.error(e.message) }
+  }
+  const showReceipts = (id: string) => {
+    const willOpen = !openReceipts[id]
+    setOpenReceipts(o => ({ ...o, [id]: willOpen }))
+    if (willOpen) fetchReceipts(id)
   }
 
   // Initials avatar for a username
@@ -198,14 +210,15 @@ export default function Alerts() {
               {p}
             </button>
           ))}
-          <Button variant="secondary" onClick={loadRanked} className="ml-auto text-xs">Smart rank</Button>
-          <Button variant="secondary" onClick={load} className="text-xs">↺</Button>
+          <Button variant="secondary" onClick={() => ranked ? (setRanked(false), load(false, false)) : loadRanked()} className="ml-auto text-xs">
+            {ranked ? 'Newest first' : 'Smart rank'}
+          </Button>
         </div>
-        {ranked && <p className="text-xs text-[var(--muted)] mb-2">Sorted by smart rank (priority × sender affinity × recency).</p>}
+        {ranked && <p className="text-xs text-[var(--muted)] mb-2">Sorted by smart rank (learned from what you acknowledge, plus recency). Alerts below your minimum priority are dimmed at the bottom.</p>}
 
         <div className="space-y-2 max-h-[560px] overflow-auto">
           {alerts.map(a => (
-            <div key={a.id} className="rounded-xl border border-[var(--border)] bg-[var(--card)] p-3">
+            <div key={a.id} className={`rounded-xl border border-[var(--border)] bg-[var(--card)] p-3 ${a.below_threshold ? 'opacity-50' : ''}`}>
               <div className="flex items-start gap-2">
                 {/* Priority dot — CRITICAL pulses */}
                 <span
@@ -226,7 +239,7 @@ export default function Alerts() {
                   </div>
 
                   {/* ACK avatar strip */}
-                  {receipts[a.id] && receipts[a.id].length > 0 && (
+                  {openReceipts[a.id] && receipts[a.id] && receipts[a.id].length > 0 && (
                     <div className="flex gap-1 mt-1.5 flex-wrap">
                       {receipts[a.id].map(r => (
                         <Avatar key={r.user} name={r.user} acked={!!r.acked_at} />
@@ -236,12 +249,18 @@ export default function Alerts() {
                 </div>
               </div>
               <div className="flex gap-2 mt-2 flex-wrap">
-                {!a.acked_by_me
-                  ? <Button onClick={() => ack(a.id)}><span className="flex items-center gap-1.5 text-xs"><CheckCheck size={13} /> Acknowledge</span></Button>
-                  : <span className="text-xs text-emerald-400 self-center">✓ You acknowledged</span>}
-                <Button variant="secondary" onClick={() => showReceipts(a.id)}><span className="text-xs">Who got it?</span></Button>
+                {a.sender === user
+                  ? <span className="text-xs text-emerald-400 self-center">✓ You raised this</span>
+                  : a.acked_by_me
+                    ? <span className="text-xs text-emerald-400 self-center">✓ You acknowledged</span>
+                    : <Button onClick={() => ack(a.id)}><span className="flex items-center gap-1.5 text-xs"><CheckCheck size={13} /> Acknowledge</span></Button>}
+                <Button variant="secondary" onClick={() => showReceipts(a.id)}>
+                  <span className="flex items-center gap-1.5 text-xs">
+                    <ChevronDown size={13} className={`transition-transform ${openReceipts[a.id] ? 'rotate-180' : ''}`} /> Who got it?
+                  </span>
+                </Button>
               </div>
-              {receipts[a.id] && (
+              {openReceipts[a.id] && receipts[a.id] && (
                 <div className="mt-2 rounded-lg bg-[var(--card-hover)] p-2 text-[11px] space-y-1">
                   {receipts[a.id].map(r => (
                     <div key={r.user} className="flex gap-2 flex-wrap">

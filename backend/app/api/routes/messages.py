@@ -4,7 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.routes.auth import get_current_user, is_admin
-from app.db.models.models import Channel, Message, MessageRead, User
+from app.db.models.models import Channel, Message, MessageRead, NotificationPreference, User
 from app.db.session import get_db
 from app.schemas import ChannelCreate, ChannelMembersUpdate, ChannelRename, EventCreate, MessageCreate
 from app.services import event_service
@@ -39,11 +39,17 @@ def _unread_counts(db: Session, username: str, channel_ids: list[int]) -> dict[i
     return {cid: n for cid, n in rows}
 
 
-def _out(c: Channel, unread: int | None = None) -> dict:
-    d = {"id": c.id, "name": c.name, "type": c.type, "members": c.members, "created_by": c.created_by}
+def _out(c: Channel, unread: int | None = None, muted: bool = False) -> dict:
+    d = {"id": c.id, "name": c.name, "type": c.type, "members": c.members, "created_by": c.created_by,
+         "muted": muted}
     if unread is not None:
         d["unread"] = unread
     return d
+
+
+def muted_channel_ids(db: Session, user: User) -> set[int]:
+    p = db.query(NotificationPreference).filter(NotificationPreference.user_id == user.id).first()
+    return set(p.mute_channel_ids or []) if p else set()
 
 
 @router.get("/channels")
@@ -52,7 +58,8 @@ def channels(db: Session = Depends(get_db), user=Depends(get_current_user)):
     rows = [c for c in db.query(Channel).filter(Channel.type != "file").order_by(Channel.id).all()
             if user.username in (c.members or [])]
     unread = _unread_counts(db, user.username, [c.id for c in rows])
-    return [_out(c, unread.get(c.id, 0)) for c in rows]
+    muted = muted_channel_ids(db, user)
+    return [_out(c, unread.get(c.id, 0), c.id in muted) for c in rows]
 
 
 @router.post("/channels")
@@ -122,12 +129,20 @@ async def update_members(channel_id: int, data: ChannelMembersUpdate, db: Sessio
         raise HTTPException(403, "Only the channel creator or an admin can remove members")
     members = list(c.members or [])
     removed = []
-    for u in data.remove or []:
-        if u == user.username:
-            raise HTTPException(400, "You cannot remove yourself — delete the channel instead")
+    for u in data.remove or []:          # removing yourself = leaving the group
         if u in members:
             members.remove(u)
             removed.append(u)
+    if not members:                      # last person left: nothing to keep
+        mids = db.query(Message.id).filter(Message.channel_id == c.id)
+        db.query(MessageRead).filter(MessageRead.message_id.in_(mids)).delete(synchronize_session=False)
+        db.query(Message).filter(Message.channel_id == c.id).delete(synchronize_session=False)
+        db.delete(c)
+        db.commit()
+        await broadcast_event("MESSAGE_SENT", {"actor": user.username, "resource": f"channel:{channel_id}",
+                                               "payload": {"action": "channel_deleted", "channel_id": channel_id}},
+                              set(removed))
+        return {"id": channel_id, "deleted": True, "members": []}
     for u in data.add or []:
         if not db.query(User.id).filter(User.username == u).first():
             raise HTTPException(400, f"User '{u}' does not exist")

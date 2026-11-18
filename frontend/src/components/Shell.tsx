@@ -6,6 +6,13 @@ import { Notifier } from './Notifier'
 import { NotificationSettings } from './NotificationSettings'
 import { OfflineBanner } from './OfflineBanner'
 import AnomalyBanner from './AnomalyBanner'
+import { useBadges } from '../hooks/useBadges'
+import { registerServiceWorker, subscribePush, unsubscribePush } from '../lib/push'
+
+const BADGE_COLOR: Record<string, string> = {
+  CRITICAL: 'var(--error)', URGENT: 'var(--warning)', IMPORTANT: 'var(--accent)',
+  NORMAL: 'var(--muted)', INFO: 'var(--muted)',
+}
 
 const links = [
   { to: '/', label: 'Dashboard', icon: Activity, end: true },
@@ -26,6 +33,28 @@ export function Shell({ children }: { children: React.ReactNode }) {
     api('/api/auth/me').then(me => setRole((me.role || '').toLowerCase())).catch(() => {})
   }, [token])
   const [light, setLight] = React.useState(() => localStorage.getItem('nexus_theme') === 'light')
+  const badges = useBadges()
+
+  // unread total in the tab title (handy on phones / background tabs)
+  React.useEffect(() => {
+    const n = badges.chat + badges.alerts
+    document.title = n > 0 ? `(${n}) Campus Nexus` : 'Campus Nexus'
+  }, [badges.chat, badges.alerts])
+
+  // Service worker + Web Push. Browsers only allow the permission prompt and
+  // audio after a user gesture, so ask on the first click.
+  React.useEffect(() => {
+    if (!token) return
+    registerServiceWorker()
+    subscribePush()
+    const firstGesture = () => {
+      if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+        Notification.requestPermission().then(p => { if (p === 'granted') subscribePush() }).catch(() => {})
+      }
+    }
+    document.addEventListener('pointerdown', firstGesture, { once: true })
+    return () => document.removeEventListener('pointerdown', firstGesture)
+  }, [token])
 
   // Apply theme class to <html> whenever state changes
   React.useEffect(() => {
@@ -40,7 +69,8 @@ export function Shell({ children }: { children: React.ReactNode }) {
     localStorage.setItem('nexus_theme', light ? 'light' : 'dark')
   }, [light])
 
-  const doLogout = () => {
+  const doLogout = async () => {
+    await unsubscribePush()   // this device should stop receiving this user's alerts
     logout()
     navigate('/login', { replace: true })
   }
@@ -59,7 +89,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
                 to={l.to}
                 end={l.end}
                 className={({ isActive }) =>
-                  `flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm whitespace-nowrap transition-colors ${
+                  `relative flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm whitespace-nowrap transition-colors ${
                     isActive
                       ? 'bg-[rgba(139,92,246,0.2)] text-[var(--accent)] font-medium'
                       : 'text-[var(--muted)] hover:text-[var(--fg)] hover:bg-[var(--card-hover)]'
@@ -68,6 +98,18 @@ export function Shell({ children }: { children: React.ReactNode }) {
               >
                 <l.icon size={15} />
                 {l.label}
+                {(() => {
+                  const n = l.to === '/chat' ? badges.chat : l.to === '/alerts' ? badges.alerts : 0
+                  if (!n) return null
+                  const color = l.to === '/alerts' ? (BADGE_COLOR[badges.alert_priority || ''] || 'var(--muted)') : 'var(--accent)'
+                  return (
+                    <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full text-[10px] font-bold text-white flex items-center justify-center"
+                      style={{ background: color }}
+                      title={l.to === '/alerts' ? `${n} unacknowledged alert${n === 1 ? '' : 's'}` : `${n} unread message${n === 1 ? '' : 's'}`}>
+                      {n > 99 ? '99+' : n}
+                    </span>
+                  )
+                })()}
               </NavLink>
             ))}
             <span className="ml-auto text-xs text-[var(--muted)] whitespace-nowrap hidden sm:block">

@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Link, useSearchParams } from 'react-router-dom'
-import { MoreVertical, Pencil, Plus, Send, Trash2, UserCheck, UserMinus, UserPlus, X } from 'lucide-react'
+
+import { BellOff, LogOut, MoreVertical, Pencil, Plus, Send, Trash2, UserCheck, UserMinus, UserPlus, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, useAuth } from '../store/useAuth'
 import { useNexusEvents } from '../hooks/useNexusEvents'
@@ -9,14 +9,12 @@ import { Card } from '../components/ui/card'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 
-type Ch = { id: number; name: string; type: string; members: string[]; created_by?: string | null; unread?: number }
-type M = { id: number; sender: string; content: string; file_link: string; read: boolean; read_by?: string[]; read_by_all?: boolean; created_at: string }
+type Ch = { id: number; name: string; type: string; members: string[]; created_by?: string | null; unread?: number; muted?: boolean }
+type M = { id: number; sender: string; content: string; file_link: string; read: boolean; read_by?: string[]; read_by_all?: boolean; created_at: string; pending?: boolean }
 type User = { username: string; email: string }
 
 export default function Chat() {
-  const { user, token } = useAuth()
-  const [params, setParams] = useSearchParams()
-  const fileParam = params.get('file') || ''
+  const { user, token, role } = useAuth()
 
   const [channels, setChannels] = useState<Ch[]>([])
   const [cid, setCid] = useState<number | null>(null)
@@ -29,7 +27,7 @@ export default function Chat() {
   const [newName, setNewName] = useState('')
   const [newType, setNewType] = useState('group')
   const [picked, setPicked] = useState<string[]>([])
-  const [fileFilter, setFileFilter] = useState(fileParam)
+  const [leaveId, setLeaveId] = useState<number | null>(null)
   // 3-dot manage menu (fixed-position pop-out so the scrolling
   // channel list never clips it) + modals
   const [menu, setMenu] = useState<{ id: number; top?: number; bottom?: number; left: number } | null>(null)
@@ -86,8 +84,9 @@ export default function Chat() {
   const loadMsg = async (silent = false) => {
     if (!cid) return
     try {
-      const q = fileFilter ? `&file_link=${encodeURIComponent(fileFilter)}` : ''
-      setMsgs(await api(`/api/messages?channel_id=${cid}${q}`, auth))
+      const rows: M[] = await api(`/api/messages?channel_id=${cid}`, auth)
+      // keep my not-yet-confirmed messages at the bottom
+      setMsgs(prev => [...rows, ...prev.filter(m => m.pending)])
     } catch (e: any) {
       if (!silent) { toast.error(e.message); return }
       // silent (live) path: channel may have been deleted elsewhere —
@@ -101,14 +100,11 @@ export default function Chat() {
 
   // Refs so one long-lived socket/interval always sees the current selection
   // without reconnecting on every channel switch.
-  const fileRef = useRef(fileFilter)
-  fileRef.current = fileFilter
   const userRef = useRef(user)
   userRef.current = user
 
   useEffect(() => { loadCh(); loadUsers() }, [])
-  useEffect(() => { loadMsg() }, [cid, fileFilter])
-  useEffect(() => { setFileFilter(fileParam) }, [fileParam])
+  useEffect(() => { setMsgs([]); loadMsg() }, [cid])
 
   // Keep latest loaders in refs so the long-lived socket/poll never
   // call a stale closure (the old bug: interval captured cid=null from
@@ -163,14 +159,36 @@ export default function Chat() {
     }, 300)
   }
 
+  // optimistic send: show immediately, swap in the server's copy, roll back on failure
   const send = async () => {
-    if (!text.trim() || !cid) return
-    const t = text; setText('')
+    const t = text.trim()
+    if (!t || !cid) return
+    setText('')
+    const tempId = -Date.now()
+    setMsgs(m => [...m, { id: tempId, sender: user, content: t, file_link: '', read: false, created_at: new Date().toISOString(), pending: true }])
     try {
-      await api('/api/messages', { ...auth, method: 'POST', body: JSON.stringify({ channel_id: cid, content: t, file_link: fileFilter }) })
-      loadMsg(); loadCh()
-    } catch (e: any) { toast.error(e.message); setText(t) }
+      const saved: M = await api('/api/messages', { ...auth, method: 'POST', body: JSON.stringify({ channel_id: cid, content: t }) })
+      setMsgs(m => m.some(x => x.id === saved.id) ? m.filter(x => x.id !== tempId) : m.map(x => x.id === tempId ? saved : x))
+    } catch (e: any) {
+      setMsgs(m => m.filter(x => x.id !== tempId))
+      setText(t)
+      toast.error(e.message)
+    }
   }
+
+  const doLeave = async () => {
+    if (leaveId == null) return
+    try {
+      await api(`/api/messages/channels/${leaveId}/members`, { ...auth, method: 'POST', body: JSON.stringify({ remove: [user] }) })
+      toast.success('You left the conversation')
+      if (cid === leaveId) { setCid(null); setMsgs([]) }
+      setLeaveId(null)
+      loadCh()
+    } catch (e: any) { toast.error(e.message) }
+  }
+
+  // creator, admins, or either side of a DM may delete; anyone may leave a group
+  const canManage = (c: Ch) => role === 'admin' || c.type === 'dm' || !c.created_by || c.created_by === user
 
   const togglePick = (u: string) => {
     setPicked(p => p.includes(u) ? p.filter(x => x !== u) : [...p, u])
@@ -295,16 +313,18 @@ export default function Chat() {
               className={`w-full px-3 py-2 rounded-xl text-sm flex items-center gap-2 transition-colors ${cid === c.id ? 'bg-[rgba(139,92,246,0.15)]' : 'hover:bg-[var(--card-hover)]'}`}
             >
               <button
-                onClick={() => { setCid(c.id); setParams(fileParam ? { file: fileParam } : {}); setMenu(null) }}
+                onClick={() => { setCid(c.id); setMenu(null) }}
                 className="flex-1 min-w-0 text-left flex items-center gap-2"
                 aria-label={`Open ${c.name}`}
               >
                 <span className="text-[var(--accent)]">#</span>
                 <span className="font-medium truncate">{c.name}</span>
                 <span className="text-xs text-[var(--muted)]">{c.type}</span>
-                {(unread[c.id] ?? 0) > 0 && (
-                  <span className="text-[11px] font-bold rounded-full bg-[var(--accent)] text-white px-2 py-0.5">{unread[c.id]}</span>
-                )}
+                {c.muted
+                  ? <BellOff size={12} className="text-[var(--muted)]" aria-label="muted" />
+                  : (unread[c.id] ?? 0) > 0 && (
+                    <span className="text-[11px] font-bold rounded-full bg-[var(--accent)] text-white px-2 py-0.5">{unread[c.id]}</span>
+                  )}
                 {cid === c.id && <UserCheck size={13} className="text-emerald-400" />}
               </button>
               <button
@@ -333,9 +353,10 @@ export default function Chat() {
                 style={{ top: menu.top, bottom: menu.bottom, left: menu.left }}
               >
                 <button onClick={() => { setRename({ id: c.id, name: c.name }); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><Pencil size={13} /> Rename</button>
-                <button onClick={() => { setAddId(c.id); setAddPick([]); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><UserPlus size={13} /> Add person</button>
-                <button onClick={() => { setRemoveId(c.id); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><UserMinus size={13} /> Remove person</button>
-                <button onClick={() => openDelete(c)} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[rgba(239,68,68,0.15)] text-left text-red-400"><Trash2 size={13} /> Delete…</button>
+                {c.type !== 'dm' && <button onClick={() => { setAddId(c.id); setAddPick([]); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><UserPlus size={13} /> Add person</button>}
+                {c.type !== 'dm' && canManage(c) && <button onClick={() => { setRemoveId(c.id); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><UserMinus size={13} /> Remove person</button>}
+                {c.type !== 'dm' && <button onClick={() => { setLeaveId(c.id); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><LogOut size={13} /> Leave</button>}
+                {canManage(c) && <button onClick={() => openDelete(c)} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[rgba(239,68,68,0.15)] text-left text-red-400"><Trash2 size={13} /> Delete…</button>}
               </div>
             </>,
             document.body
@@ -351,26 +372,18 @@ export default function Chat() {
             <div className="flex items-center gap-2 flex-wrap pb-3 border-b border-[var(--border)] mb-3">
               <h2 className="font-bold">#{active?.name}</h2>
               <span className="text-xs text-[var(--muted)]">{active?.type} · {active?.members.join(', ')}</span>
-              {fileFilter ? (
-                <span className="ml-auto text-xs rounded-full bg-[rgba(139,92,246,0.15)] text-[var(--accent)] px-2 py-1">
-                  File thread: {fileFilter}
-                  <button onClick={() => { setFileFilter(''); setParams({}) }} className="ml-1 underline">clear</button>
-                  <Link to={`/files`} className="ml-2 underline">open file</Link>
-                </span>
-              ) : (
-                <span className="ml-auto text-xs text-[var(--muted)]">Tip: open a file in Files → “Open in Chat” to discuss it here.</span>
-              )}
+              <span className="ml-auto text-xs text-[var(--muted)]">File discussions live in Files → Discussion.</span>
             </div>
             <div ref={msgListRef} className="flex-1 space-y-2 overflow-auto mb-3 max-h-[380px]">
               {msgs.map(m => (
-                <div key={m.id} className="rounded-xl bg-[var(--card)] p-3 text-sm">
+                <div key={m.id} className={`rounded-xl bg-[var(--card)] p-3 text-sm ${m.pending ? 'opacity-60' : ''}`}>
                   <span className="font-medium">{m.sender}</span>
                   {m.file_link && <span className="ml-2 text-xs text-[var(--accent)]">📎 {m.file_link}</span>}
                   <div className="mt-0.5">{m.content}</div>
                   <div className="text-[11px] text-[var(--muted)] mt-1 flex items-center gap-1.5">
-                    {new Date(m.created_at).toLocaleString()}
+                    {m.pending ? 'sending…' : new Date(m.created_at).toLocaleString()}
                     {/* ✓✓ delivery ticks */}
-                    {m.sender === user && (
+                    {m.sender === user && !m.pending && (
                       <span
                         className="font-bold"
                         style={{ color: m.read ? 'var(--accent)' : 'var(--muted)' }}
@@ -382,7 +395,7 @@ export default function Chat() {
                   </div>
                 </div>
               ))}
-              {msgs.length === 0 && <p className="text-xs text-[var(--muted)] text-center py-8">No messages{fileFilter ? ' in this file thread' : ''} — say hello.</p>}
+              {msgs.length === 0 && <p className="text-xs text-[var(--muted)] text-center py-8">No messages — say hello.</p>}
               <div ref={msgEndRef} />
             </div>
             {/* Typing indicator */}
@@ -401,7 +414,7 @@ export default function Chat() {
                 value={text}
                 onChange={e => { setText(e.target.value); sendTyping() }}
                 onKeyDown={e => e.key === 'Enter' && send()}
-                placeholder={fileFilter ? `Reply in thread ${fileFilter}…` : 'Message…'}
+                placeholder="Message…"
                 aria-label="Message input"
               />
               <Button onClick={send}><span className="flex items-center gap-1.5"><Send size={14} /> Send</span></Button>
@@ -468,6 +481,18 @@ export default function Chat() {
         </div>
       )}
 
+      {leaveId != null && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={() => setLeaveId(null)}>
+          <div className="w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4" onClick={e => e.stopPropagation()}>
+            <h3 className="font-bold mb-1">Leave “{channels.find(c => c.id === leaveId)?.name}”?</h3>
+            <p className="text-sm text-[var(--muted)] mb-3">You stop seeing this conversation. Messages stay for the others (if you're the last member, it is deleted).</p>
+            <div className="flex gap-2">
+              <Button variant="secondary" onClick={() => setLeaveId(null)} className="flex-1">Cancel</Button>
+              <Button variant="destructive" onClick={doLeave} className="flex-1">Leave</Button>
+            </div>
+          </div>
+        </div>
+      )}
       {del && (
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={() => setDel(null)}>
           <div className="w-full max-w-sm rounded-2xl border border-red-500/40 bg-[var(--card)] p-4" onClick={e => e.stopPropagation()}>

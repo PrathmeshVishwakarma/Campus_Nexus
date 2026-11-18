@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.api.websockets.events_ws import manager
 from app.db.models.models import Event
 from app.schemas import EventCreate
-from app.services.notify import delivery_flags, load_prefs, should_notify
+from app.services.notify import decide, delivery_flags, load_prefs
 from app.services.visibility import AudienceResolver
 
 log = logging.getLogger("campus_nexus.events")
@@ -52,8 +52,8 @@ def _plan_delivery(db: Session, ev: Event):
     per_user = {}
     for u in recipients:
         p = prefs.get(u)
-        per_user[u] = {"notify": should_notify(p, ev.type, ev.actor, u, ev.resource, ev.payload or {}),
-                       **delivery_flags(p)}
+        d = decide(p, ev.type, ev.actor, u, ev.resource, ev.payload or {})
+        per_user[u] = {"notify": d == "notify", "held": d == "held", **delivery_flags(p)}
     return audience, per_user
 
 
