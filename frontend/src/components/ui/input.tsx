@@ -1,7 +1,7 @@
 import * as React from 'react'
 
 export interface InputProps extends React.InputHTMLAttributes<HTMLInputElement> {
-  type?: 'text' | 'email' | 'password' | 'file'
+  type?: 'text' | 'email' | 'password' | 'file' | 'time' | 'number' | 'search'
   className?: string
 }
 

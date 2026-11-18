@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { sessionExpired, useAuth } from '../store/useAuth'
 
 /**
  * useNexusEvents — ONE shared WebSocket for the whole app.
@@ -11,7 +12,8 @@ import { useEffect, useRef, useState } from 'react'
  *   const { connected, status } = useNexusEvents(e => { ... }, token)
  */
 
-export type LiveEvent = { event: string; data: any }
+/** notify/sound/toast are computed server-side from the user's notification preferences. */
+export type LiveEvent = { event: string; data: any; notify?: boolean; sound?: boolean; toast?: boolean }
 export type ConnStatus = 'connecting' | 'open' | 'closed'
 
 let socket: WebSocket | null = null
@@ -73,9 +75,14 @@ function connect(token: string) {
     if (!parsed || parsed.event === 'PONG') return
     eventListeners.forEach((fn) => { try { fn(parsed as LiveEvent) } catch { /* noop */ } })
   }
-  socket.onclose = () => {
+  socket.onclose = (ev) => {
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
     setStatus('closed')
+    if (ev.code === 4401) {        // server rejected the token: session is over
+      manualClose = true
+      sessionExpired()
+      return
+    }
     if (!manualClose) scheduleReconnect()
   }
   socket.onerror = () => { try { socket?.close() } catch { /* noop */ } }
@@ -93,6 +100,18 @@ function ensureConnected(token: string) {
   }
 }
 
+/** Close the shared socket (logout). */
+export function disconnect() {
+  manualClose = true
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  try { socket?.close() } catch { /* noop */ }
+  socket = null
+  currentToken = ''
+  setStatus('closed')
+}
+
+useAuth.subscribe((s, prev) => { if (prev.token && !s.token) disconnect() })
+
 /** Read the current status without subscribing (handy outside React). */
 export function getConnectionStatus(): ConnStatus {
   return status
@@ -104,7 +123,7 @@ export function useNexusEvents(onEvent?: (e: LiveEvent) => void, token?: string)
   cb.current = onEvent
 
   useEffect(() => {
-    const tok = token ?? localStorage.getItem('nexus_token') ?? ''
+    const tok = token ?? useAuth.getState().token
     if (!tok) return // not authenticated -> no socket
     ensureConnected(tok)
 

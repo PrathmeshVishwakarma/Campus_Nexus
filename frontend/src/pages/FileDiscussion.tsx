@@ -3,6 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, Send } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, useAuth } from '../store/useAuth'
+import { useNexusEvents } from '../hooks/useNexusEvents'
 import { Card } from '../components/ui/card'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
@@ -34,7 +35,7 @@ export default function FileDiscussion() {
       setComments(res.comments || [])
       setDenied(false)
     } catch (e: any) {
-      if (String(e.message).includes('403') || String(e.message).includes('No access')) setDenied(true)
+      if (e?.status === 403 || String(e.message).includes('No access')) setDenied(true)
       else if (!silent) toast.error(e.message)
     }
   }
@@ -44,43 +45,15 @@ export default function FileDiscussion() {
 
   useEffect(() => { load() }, [path])
 
+  // live updates over the shared socket; poll only while it is down
+  const { connected } = useNexusEvents((e) => {
+    if (e.event === 'FILE_COMMENT' && (e.data?.resource || '') === pathRef.current) loadRef.current(true)
+  }, token)
   useEffect(() => {
-    let alive = true
-    let ws: WebSocket | null = null
-    let retry = 0
-    let retryTimer: ReturnType<typeof setTimeout> | null = null
-    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
-    const connect = () => {
-      if (!alive || !path) return
-      try {
-        ws = new WebSocket(`${scheme}://${location.host}/ws/events?token=${token}`)
-      } catch { schedule(); return }
-      ws.onopen = () => { retry = 0 }
-      ws.onmessage = (m) => {
-        if (!alive) return
-        try {
-          const e = JSON.parse(m.data)
-          if (e.event !== 'FILE_COMMENT') return
-          if ((e.data?.resource || '') === pathRef.current) loadRef.current(true)
-        } catch {}
-      }
-      ws.onerror = () => { try { ws?.close() } catch {} }
-      ws.onclose = () => schedule()
-    }
-    const schedule = () => {
-      if (!alive) return
-      retry = Math.min(retry + 1, 5)
-      if (retryTimer) clearTimeout(retryTimer)
-      retryTimer = setTimeout(() => { if (alive) connect() }, Math.min(1000 * 2 ** retry, 10000))
-    }
-    connect()
-    const ping = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) { try { ws.send(JSON.stringify({ action: 'PING' })) } catch {} }
-    }, 25000)
-    const poll = setInterval(() => { if (alive && !document.hidden) loadRef.current(true) }, 4000)
-    return () => { alive = false; clearInterval(ping); clearInterval(poll); if (retryTimer) clearTimeout(retryTimer); try { ws?.close() } catch {} }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, path])
+    if (connected || !path) return
+    const poll = setInterval(() => { if (!document.hidden) loadRef.current(true) }, 5000)
+    return () => clearInterval(poll)
+  }, [connected, path])
 
   const send = async () => {
     if (!text.trim() || !path) return

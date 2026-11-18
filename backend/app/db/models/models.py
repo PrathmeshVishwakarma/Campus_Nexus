@@ -3,9 +3,20 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.timeutil import utcnow
 from app.db.session import Base
 
 
@@ -19,18 +30,8 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     email: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     hashed_password: Mapped[str] = mapped_column(String(256))
-    role: Mapped[str] = mapped_column(String(32), default="student")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class SharedFolder(Base):
-    __tablename__ = "shared_folders"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(128))
-    path: Mapped[str] = mapped_column(String(512))
-    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    sync_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    role: Mapped[str] = mapped_column(String(32), default="student")  # student|faculty|staff|admin
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class RootConfig(Base):
@@ -39,8 +40,7 @@ class RootConfig(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     path: Mapped[str] = mapped_column(String(1024), default="shared/demo_files")
     updated_by: Mapped[str] = mapped_column(String(64), default="system")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
-                                                 onupdate=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class FolderACL(Base):
@@ -50,8 +50,7 @@ class FolderACL(Base):
     subfolder: Mapped[str] = mapped_column(String(512), unique=True, index=True)
     members: Mapped[list] = mapped_column(JSON, default=list)
     updated_by: Mapped[str] = mapped_column(String(64), default="system")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
-                                                 onupdate=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class FileThread(Base):
@@ -60,7 +59,7 @@ class FileThread(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     file_path: Mapped[str] = mapped_column(String(512), unique=True, index=True)
     created_by: Mapped[str] = mapped_column(String(64), default="unknown")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class FileComment(Base):
@@ -69,10 +68,11 @@ class FileComment(Base):
     thread_id: Mapped[int] = mapped_column(ForeignKey("file_threads.id"), index=True)
     sender: Mapped[str] = mapped_column(String(64))
     content: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class FileVersion(Base):
+    """One committed version of a file. Content lives in the blob store by hash."""
     __tablename__ = "file_versions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     file_path: Mapped[str] = mapped_column(String(512), index=True)
@@ -82,7 +82,7 @@ class FileVersion(Base):
     size: Mapped[int] = mapped_column(Integer, default=0)
     modified_by: Mapped[str] = mapped_column(String(64), default="unknown")
     vector_clock: Mapped[dict] = mapped_column(JSON, default=dict)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Event(Base):
@@ -96,16 +96,17 @@ class Event(Base):
     priority: Mapped[int] = mapped_column(Integer, default=50)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     vector_clock: Mapped[dict] = mapped_column(JSON, default=dict)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
 
 
 class Channel(Base):
     __tablename__ = "channels"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(128))
-    type: Mapped[str] = mapped_column(String(32), default="group")  # dm|group|department|file
+    type: Mapped[str] = mapped_column(String(32), default="group")  # dm|group|department
     members: Mapped[dict] = mapped_column(JSON, default=list)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Message(Base):
@@ -116,8 +117,20 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text)
     file_link: Mapped[str] = mapped_column(String(512), default="")
     delivered: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Deprecated: a single shared flag cannot express per-user reads. Kept only so
+    # old rows/migrations stay valid; read state lives in MessageRead.
     read: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class MessageRead(Base):
+    """Per-user read receipt for a message."""
+    __tablename__ = "message_reads"
+    __table_args__ = (UniqueConstraint("message_id", "username", name="uq_message_read"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), index=True)
+    username: Mapped[str] = mapped_column(String(64), index=True)
+    read_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Alert(Base):
@@ -127,8 +140,9 @@ class Alert(Base):
     body: Mapped[str] = mapped_column(Text)
     priority: Mapped[str] = mapped_column(String(32), default="NORMAL")
     sender: Mapped[str] = mapped_column(String(64), default="system")
+    # "all" | "role:<role>[,<role>]" | "users:<u1>,<u2>"
     target_scope: Mapped[str] = mapped_column(String(64), default="all")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
@@ -137,7 +151,7 @@ class AlertReceipt(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     alert_id: Mapped[str] = mapped_column(ForeignKey("alerts.id"), index=True)
     user: Mapped[str] = mapped_column(String(64), index=True)
-    delivered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    delivered_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     acked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
 
@@ -149,7 +163,7 @@ class Peer(Base):
     ip: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default="online")
     latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
-    last_seen: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_seen: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class SyncTask(Base):
@@ -159,33 +173,11 @@ class SyncTask(Base):
     priority: Mapped[int] = mapped_column(Integer, default=40)
     status: Mapped[str] = mapped_column(String(32), default="queued")
     retries: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class SharedFolderMember(Base):
-    """ACL row: which users may access a restricted SharedFolder.
-
-    A folder with NO member rows is public (everyone can see it). As soon as it
-    has one or more rows, it is restricted to those usernames (plus its owner).
-    """
-
-    __tablename__ = "shared_folder_members"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    folder_id: Mapped[int] = mapped_column(ForeignKey("shared_folders.id"), index=True)
-    username: Mapped[str] = mapped_column(String(64), index=True)
-    permission: Mapped[str] = mapped_column(String(16), default="edit")  # view | edit
-
-
-class AppSetting(Base):
-    """Simple key/value store for node-level settings (e.g. the shared root path)."""
-
-    __tablename__ = "app_settings"
-    key: Mapped[str] = mapped_column(String(64), primary_key=True)
-    value: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class NotificationPreference(Base):
-    """Per-user notification settings (Feature 3)."""
+    """Per-user notification settings, applied when events are pushed over the socket."""
 
     __tablename__ = "notification_preferences"
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
@@ -201,4 +193,4 @@ class NotificationPreference(Base):
     sound: Mapped[bool] = mapped_column(Boolean, default=True)
     desktop_toast: Mapped[bool] = mapped_column(Boolean, default=True)
     email_digest: Mapped[bool] = mapped_column(Boolean, default=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

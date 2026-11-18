@@ -1,7 +1,9 @@
 import * as React from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
-import { Activity, Bell, FolderOpen, LogOut, MessageSquare, Moon, Network, Sun } from 'lucide-react'
-import { useAuth } from '../store/useAuth'
+import { Activity, Bell, BellRing, FolderOpen, LogOut, MessageSquare, Moon, Network, Sun } from 'lucide-react'
+import { api, useAuth } from '../store/useAuth'
+import { Notifier } from './Notifier'
+import { NotificationSettings } from './NotificationSettings'
 import { OfflineBanner } from './OfflineBanner'
 import AnomalyBanner from './AnomalyBanner'
 
@@ -14,8 +16,15 @@ const links = [
 ]
 
 export function Shell({ children }: { children: React.ReactNode }) {
-  const { token, user, logout } = useAuth()
+  const { token, user, role, logout, setRole } = useAuth()
   const navigate = useNavigate()
+  const [showPrefs, setShowPrefs] = React.useState(false)
+
+  // the role drives admin-only controls (the server enforces them regardless)
+  React.useEffect(() => {
+    if (!token) return
+    api('/api/auth/me').then(me => setRole((me.role || '').toLowerCase())).catch(() => {})
+  }, [token])
   const [light, setLight] = React.useState(() => localStorage.getItem('nexus_theme') === 'light')
 
   // Apply theme class to <html> whenever state changes
@@ -62,8 +71,15 @@ export function Shell({ children }: { children: React.ReactNode }) {
               </NavLink>
             ))}
             <span className="ml-auto text-xs text-[var(--muted)] whitespace-nowrap hidden sm:block">
-              {user}
+              {user}{role && role !== 'student' ? ` · ${role}` : ''}
             </span>
+            <button
+              onClick={() => setShowPrefs(true)}
+              className="p-2 rounded-lg text-[var(--muted)] hover:text-[var(--fg)] hover:bg-[var(--card-hover)] transition-colors"
+              aria-label="Notification settings" title="Notification settings"
+            >
+              <BellRing size={15} />
+            </button>
             {/* Global dark/light toggle */}
             <button
               onClick={() => setLight(v => !v)}
@@ -83,6 +99,8 @@ export function Shell({ children }: { children: React.ReactNode }) {
           </div>
         </nav>
       )}
+      {token && <Notifier />}
+      {showPrefs && <NotificationSettings onClose={() => setShowPrefs(false)} />}
       <OfflineBanner />
       {token && (
         <div className="max-w-7xl mx-auto px-4 pt-3">

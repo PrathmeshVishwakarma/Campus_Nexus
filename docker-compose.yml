@@ -17,11 +17,19 @@ services:
     ports: ["8000:8000"]
     environment:
       DATABASE_URL: postgresql://nexus:nexus@db:5432/campus_nexus
-    volumes: ["./shared:/app/shared"]
+      # set in ./.env (see .env.example); if empty a key is generated and kept in the data volume
+      SECRET_KEY: ${SECRET_KEY:-}
+      ADMIN_USERNAMES: ${ADMIN_USERNAMES:-}
+      SHARED_FOLDER: /app/shared/demo_files
+      DATA_DIR: /app/data
+    volumes:
+      - "./shared:/app/shared"
+      - "nexusdata:/app/data"
     depends_on:
       db:
         condition: service_healthy
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    # one worker: the anomaly detector and live sockets keep per-process state
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 
   frontend:
     build: ./frontend
@@ -30,3 +38,4 @@ services:
 
 volumes:
   pgdata:
+  nexusdata:

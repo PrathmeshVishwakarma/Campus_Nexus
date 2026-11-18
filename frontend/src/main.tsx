@@ -1,16 +1,17 @@
-import React, { useEffect } from 'react'
+import React, { Suspense, lazy, useEffect } from 'react'
 import ReactDOM from 'react-dom/client'
 import './index.css'
 import { BrowserRouter, Route, Routes, Navigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Toaster } from 'sonner'
 import { useAuth } from './store/useAuth'
-import { Dashboard } from './pages/Dashboard'
-import Files from './pages/Files'
-import FileDiscussion from './pages/FileDiscussion'
-import Chat from './pages/Chat'
-import Alerts from './pages/Alerts'
-import Network from './pages/Network'
+// route-level code splitting keeps the initial bundle small
+const Dashboard = lazy(() => import('./pages/Dashboard').then(m => ({ default: m.Dashboard })))
+const Files = lazy(() => import('./pages/Files'))
+const FileDiscussion = lazy(() => import('./pages/FileDiscussion'))
+const Chat = lazy(() => import('./pages/Chat'))
+const Alerts = lazy(() => import('./pages/Alerts'))
+const Network = lazy(() => import('./pages/Network'))
 import { Shell } from './components/Shell'
 import { Login } from './components/Login'
 import { Register } from './components/Register'
@@ -41,6 +42,7 @@ function App() {
   return (
     <Shell>
       <ThemeLoader />
+      <Suspense fallback={<div className="p-6 text-sm text-[var(--muted)]">Loading…</div>}>
       <Routes>
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
@@ -52,6 +54,7 @@ function App() {
         <Route path="/network" element={<PrivateRoute><Network /></PrivateRoute>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+      </Suspense>
     </Shell>
   )
 }

@@ -8,7 +8,8 @@ export function Login() {
   const { setAuth } = useAuth()
   const navigate = useNavigate()
   const [loggingIn, setLoggingIn] = React.useState(false)
-  const [error, setError] = React.useState('')
+  const [error, setError] = React.useState(() =>
+    new URLSearchParams(location.search).get('expired') ? 'Your session expired — please log in again.' : '')
 
   const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()

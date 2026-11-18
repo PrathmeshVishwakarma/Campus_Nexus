@@ -4,14 +4,7 @@ import hashlib
 from pathlib import Path
 
 from app.core.config import settings
-
-
-def sha256_file(path: str | Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for b in iter(lambda: f.read(65536), b""):
-            h.update(b)
-    return h.hexdigest()
+from app.services.storage import sha256_file  # noqa: F401  (re-exported)
 
 
 def chunk_file(path: str | Path, chunk_size: int | None = None) -> list[dict]:
@@ -28,14 +21,26 @@ def chunk_file(path: str | Path, chunk_size: int | None = None) -> list[dict]:
     return chunks
 
 
+def dominates(a: dict, b: dict) -> bool:
+    """a >= b component-wise (a has seen everything b has)."""
+    return all(a.get(k, 0) >= v for k, v in (b or {}).items())
+
+
 def detect_conflict(local_clock: dict, remote_clock: dict) -> bool:
     """True if neither clock dominates (concurrent edit)."""
-    l_dom = all(local_clock.get(k, 0) >= v for k, v in remote_clock.items())
-    r_dom = all(remote_clock.get(k, 0) >= v for k, v in local_clock.items())
-    return not (l_dom or r_dom)
+    return not (dominates(local_clock or {}, remote_clock or {}) or
+                dominates(remote_clock or {}, local_clock or {}))
+
+
+def merge_clocks(*clocks: dict) -> dict:
+    out: dict = {}
+    for c in clocks:
+        for k, v in (c or {}).items():
+            out[k] = max(out.get(k, 0), int(v))
+    return out
 
 
 def bump_clock(clock: dict, node_id: str) -> dict:
-    clock = dict(clock)
+    clock = dict(clock or {})
     clock[node_id] = clock.get(node_id, 0) + 1
     return clock

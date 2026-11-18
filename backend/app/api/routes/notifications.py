@@ -1,11 +1,13 @@
-"""Per-user notification preferences (Feature 3).
+"""Per-user notification preferences.
 
 Exposes GET/PATCH /api/notifications/settings. A preference row is created
 lazily with sensible defaults (everything on, min priority INFO, no DND) the
-first time a user reads or writes their settings.
+first time a user reads or writes their settings. The preferences are applied
+to every live event as its per-user ``notify`` flag (services/notify.py).
+``email_digest`` is stored for a future mail integration; no mail is sent.
 """
 
-from datetime import datetime
+from app.core.timeutil import utcnow
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -100,9 +102,13 @@ def update_settings(data: NotificationSettingsPatch, db: Session = Depends(get_d
         if field in payload and not _valid_hhmm(payload[field] or ""):
             raise HTTPException(400, f"{field} must be 'HH:MM' or empty")
 
+    if "mute_folder_paths" in payload and payload["mute_folder_paths"] is not None:
+        payload["mute_folder_paths"] = sorted({p.replace("\\", "/").strip().strip("/")
+                                               for p in payload["mute_folder_paths"] if p and p.strip()})
+
     for key, value in payload.items():
         setattr(pref, key, value)
-    pref.updated_at = datetime.utcnow()
+    pref.updated_at = utcnow()
     db.commit()
     db.refresh(pref)
     return _serialize(pref)

@@ -4,6 +4,7 @@ import { motion } from 'framer-motion'
 import { Activity, Bell, Files, MessageSquare, Search } from 'lucide-react'
 import { useAuth } from '../store/useAuth'
 import { api } from '../store/useAuth'
+import { useNexusEvents } from '../hooks/useNexusEvents'
 import { Button } from '../components/ui/button'
 import { Card } from '../components/ui/card'
 import {
@@ -16,49 +17,20 @@ export function Dashboard() {
   const { user, token } = useAuth()
 
   useEffect(() => {
-    api('/api/events?limit=200', { headers: { Authorization: `Bearer ${token}` } }).then(setEvents).catch(() => {});
-    let alive = true
-    let ws: WebSocket | null = null
-    let retry = 0
-    let retryTimer: ReturnType<typeof setTimeout> | null = null
-    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
-    const connect = () => {
-      if (!alive) return
-      try {
-        ws = new WebSocket(`${scheme}://${location.host}/ws/events?token=${token}`);
-      } catch { scheduleRetry(); return }
-      ws.onopen = () => { retry = 0 }
-      ws.onmessage = (m) => {
-        if (!alive) return
-        try {
-          const d = JSON.parse(m.data);
-          if (d.event === 'PONG' || d.event === 'TYPING') return
-          setEvents(prev => [{ id: d.data.id, type: d.event, actor: d.data.actor, resource: d.data.resource, timestamp: d.data.timestamp, priority: d.data.priority }, ...prev].slice(0, 500));
-        } catch {}
-      };
-      ws.onerror = () => { try { ws?.close() } catch {} }
-      ws.onclose = () => { scheduleRetry() }
-    }
-    const scheduleRetry = () => {
-      if (!alive) return
-      retry = Math.min(retry + 1, 5)
-      const delay = Math.min(1000 * 2 ** retry, 10000)
-      if (retryTimer) clearTimeout(retryTimer)
-      retryTimer = setTimeout(() => { if (alive) connect() }, delay)
-    }
-    connect()
-    const ping = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try { ws.send(JSON.stringify({ action: 'PING' })) } catch {}
-      }
-    }, 25000)
-    return () => { alive = false; clearInterval(ping); if (retryTimer) clearTimeout(retryTimer); try { ws?.close() } catch {} };
-  }, [token]);
+    api('/api/events?limit=200').then(setEvents).catch(() => {})
+  }, [token])
+
+  // one shared, authenticated socket for the whole app
+  useNexusEvents((d) => {
+    if (d.event === 'PONG' || d.event === 'TYPING' || d.event === 'MESSAGE_READ' || !d.data?.id) return
+    setEvents(prev => [{ id: d.data.id, type: d.event, actor: d.data.actor, resource: d.data.resource,
+      timestamp: d.data.timestamp, priority: d.data.priority }, ...prev].slice(0, 500))
+  }, token)
 
   const shown = events.filter(e => !query || `${e.type} ${e.actor} ${e.resource}`.toLowerCase().includes(query.toLowerCase()))
 
   const tiles = [
-    { icon: Files, label: 'Files synced', getVal: () => events.filter(e => e.type.startsWith('SYNC')).length },
+    { icon: Files, label: 'Files synced', getVal: () => events.filter(e => ['FILE_CREATED', 'FILE_MODIFIED', 'VERSION_CONFLICT', 'FILE_RESTORED'].includes(e.type)).length },
     { icon: MessageSquare, label: 'Messages', getVal: () => events.filter(e => e.type.startsWith('MESSAGE')).length },
     { icon: Bell, label: 'Alerts', getVal: () => events.filter(e => e.type.startsWith('ALERT')).length },
     { icon: Activity, label: 'Total events', getVal: () => events.length },

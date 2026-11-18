@@ -1,30 +1,118 @@
 import asyncio
+import logging
 import socket
-from datetime import datetime
-from pathlib import Path
+import threading
+import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import alerts, auth, events, files, messages, notifications, peers
-from app.api.websockets.events_ws import broadcast_event, manager
-from app.db.base import Base
-from app.db.session import SessionLocal, engine
-from app.schemas import EventCreate
+from app.api.websockets.events_ws import manager
+from app.core.config import settings
+from app.core.timeutil import utcnow
+from app.db.init_db import init_db
+from app.db.session import SessionLocal
 from app.services import event_service, scheduler
+from app.services.storage import cleanup_stale_staging, get_root, on_root_changed
 
-# Alembic owns the full migration history, but create_all is idempotent and only
-# creates tables that don't yet exist. This guarantees newer tables
-# (shared_folder_members, app_settings, notification_preferences) are present for
-# both `uvicorn` and the pytest suite without requiring a manual `alembic upgrade`.
-try:
-    Base.metadata.create_all(bind=engine)
-except Exception as _e:  # pragma: no cover - never block startup on this
-    print("[main] create_all skipped:", _e)
-event_service.set_broadcaster(broadcast_event)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("campus_nexus")
 
-app = FastAPI(title="Campus Nexus", version="0.2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+# Alembic owns the schema: bring the DB to head (stamping legacy create_all DBs).
+init_db()
+with SessionLocal() as _db:
+    auth.promote_configured_admins(_db)
+
+
+def _start_background():
+    """File watcher -> versions + event bus; UDP discovery; stale-peer sweeper."""
+    from app.db.models.models import Peer
+    from app.services.file_watcher import watcher
+    from app.services.peer_discovery import start_listener_thread
+
+    with SessionLocal() as db:
+        root = get_root(db)
+        try:
+            n = files.index_untracked(db, root)
+            if n:
+                log.info("indexed %d existing file(s) as v1", n)
+        except Exception:
+            log.exception("initial file indexing failed")
+
+    def on_fs(etype: str, path: str):
+        db = SessionLocal()
+        try:
+            _, guard = files.record_disk_change(db, get_root(db), path, etype)
+            if guard and guard[0] and not scheduler.is_paused():
+                scheduler.pause()
+                from app.schemas import EventCreate
+                event_service.emit_event_sync(db, EventCreate(
+                    type="ANOMALY_DETECTED", actor="ml-engine", resource="filesystem", priority=100,
+                    payload={"reason": "mass file activity burst on disk", "score": round(guard[1], 3),
+                             "window": guard[2]}))
+        except Exception:
+            log.exception("watcher callback failed for %s", path)
+        finally:
+            db.close()
+
+    try:
+        watcher.start(root, on_fs)
+        on_root_changed(watcher.restart)
+        log.info("watching %s", root)
+    except Exception as e:
+        log.warning("file watcher disabled: %s", e)
+
+    def on_peer(host: str, ip: str):
+        db = SessionLocal()
+        try:
+            p = db.query(Peer).filter(Peer.hostname == host).first()
+            if not p:
+                db.add(Peer(hostname=host, ip=ip, status="online"))
+            else:
+                p.ip, p.status, p.last_seen = ip, "online", utcnow()
+            db.commit()
+        finally:
+            db.close()
+
+    try:
+        start_listener_thread(port=settings.discovery_port, on_peer=on_peer)
+    except Exception as e:
+        log.warning("peer discovery disabled: %s", e)
+
+    def sweeper():
+        while True:
+            time.sleep(30)
+            try:
+                with SessionLocal() as db:
+                    peers.mark_stale(db)
+                cleanup_stale_staging()
+            except Exception:
+                log.exception("sweeper failed")
+
+    threading.Thread(target=sweeper, daemon=True).start()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    event_service.set_loop(asyncio.get_running_loop())
+    sched = asyncio.create_task(scheduler.scheduler_loop())
+    threading.Thread(target=_start_background, daemon=True).start()
+    try:
+        yield
+    finally:
+        sched.cancel()
+        event_service.set_loop(None)
+        try:
+            from app.services.file_watcher import watcher
+            watcher.stop()
+        except Exception:
+            pass
+
+
+app = FastAPI(title="Campus Nexus", version="0.3.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_credentials=False,
                    allow_methods=["*"], allow_headers=["*"])
 
 app.include_router(auth.router)
@@ -43,150 +131,38 @@ def health():
 
 @app.websocket("/ws/events")
 async def ws_events(ws: WebSocket):
-    await manager.connect(ws)
+    """Live events. Requires ?token=<JWT>; each user only receives events they may see."""
+    token = ws.query_params.get("token", "")
+    with SessionLocal() as db:
+        user = auth.user_from_token(token, db) if token else None
+        username, admin = (user.username, auth.is_admin(user)) if user else ("", False)
+    if not user:
+        await ws.close(code=4401, reason="invalid or expired token")
+        return
+    conn = await manager.connect(ws, username, admin)
     try:
         while True:
             try:
                 msg = await ws.receive_json()
-            except WebSocketDisconnect:
-                break
-            except RuntimeError:
-                # client disconnected mid-receive (proxy reset, tab closed)
+            except (WebSocketDisconnect, RuntimeError):
                 break
             except Exception:
-                # malformed frame — ignore, keep connection alive
-                continue
+                continue   # malformed frame — ignore, keep connection alive
             try:
                 if msg.get("action") == "PING":
                     await ws.send_json({"event": "PONG", "data": {}})
                 elif msg.get("action") == "ACK_ALERT":
-                    db = SessionLocal()
-                    try:
-                        from app.db.models.models import AlertReceipt
-                        r = db.query(AlertReceipt).filter(
-                            AlertReceipt.alert_id == msg.get("alert_id")).first()
-                        if r:
-                            r.acked_at = datetime.utcnow()
-                            db.commit()
-                    finally:
-                        db.close()
+                    with SessionLocal() as db:
+                        me = db.query(auth.User).filter(auth.User.username == username).first()
+                        if me:
+                            try:
+                                await alerts.do_ack(db, str(msg.get("alert_id", "")), me)
+                            except Exception as e:  # 404 etc. -> tell the client, keep socket
+                                await ws.send_json({"event": "ERROR",
+                                                    "data": {"action": "ACK_ALERT", "detail": str(e)}})
             except (WebSocketDisconnect, RuntimeError):
                 break
             except Exception:
                 continue
     finally:
-        manager.disconnect(ws)
-
-
-def _start_background():
-    """File watcher -> Event bus + peer discovery -> DB, all in daemon threads."""
-    from app.db.models.models import Peer
-    from app.ml.anomaly import record_window
-    from app.services.peer_discovery import start_listener_thread
-
-    SHARED = Path(__file__).resolve().parents[3] / "shared" / "demo_files"
-    try:
-        _db = SessionLocal()
-        try:
-            from app.db.models.models import RootConfig as _RC
-            _row = _db.query(_RC).filter(_RC.id == 1).first()
-            if _row and _row.path:
-                _p = Path(_row.path)
-                SHARED = _p if _p.is_absolute() else Path(__file__).resolve().parents[3] / _row.path
-        finally:
-            _db.close()
-    except Exception:
-        pass
-    SHARED.mkdir(parents=True, exist_ok=True)
-
-    def on_fs(etype: str, path: str):
-        db = SessionLocal()
-        try:
-            from app.services.sync_engine import sha256_file
-            p = Path(path)
-            sha = sha256_file(p)[:16] if p.exists() and p.is_file() else ""
-            ev = event_service.emit_event_sync(db, EventCreate(
-                type=etype, actor="node-agent", resource=path, priority=60,
-                payload={"sha": sha}))
-            record_window(1 if etype == "FILE_MODIFIED" else 0, 1 if etype == "FILE_DELETED" else 0,
-                          1 if etype == "FILE_CREATED" else 0, 0.1)
-            return ev
-        except Exception as e:
-            print("[watcher]", e)
-        finally:
-            db.close()
-
-    try:
-        from app.services.file_watcher import start_watcher as _sw
-        _sw(SHARED, on_fs)
-        print(f"[main] watching {SHARED}")
-    except Exception as e:
-        print("[main] watcher skipped (pip install watchdog to enable):", e)
-
-    def on_peer(host: str, ip: str):
-        db = SessionLocal()
-        try:
-            p = db.query(Peer).filter(Peer.hostname == host).first()
-            if not p:
-                from app.db.models.models import Peer as P
-                db.add(P(hostname=host, ip=ip, status="online"))
-            else:
-                p.ip = ip
-                p.status = "online"
-                p.last_seen = datetime.utcnow()
-            db.commit()
-        finally:
-            db.close()
-
-    try:
-        start_listener_thread(on_peer=on_peer)
-    except Exception as e:
-        print("[main] discovery skipped:", e)
-
-    def stale_sweeper():
-        import time
-        while True:
-            time.sleep(30)
-            db = SessionLocal()
-            try:
-                now = datetime.utcnow()
-                for p in db.query(Peer).all():
-                    if (now - p.last_seen).total_seconds() > 60 and p.status != "offline":
-                        p.status = "offline"
-                db.commit()
-            except Exception:
-                pass
-            finally:
-                db.close()
-
-    import threading as _th
-    _th.Thread(target=stale_sweeper, daemon=True).start()
-
-
-# sync emit helper (watcher runs outside async loop)
-def _patch_sync_emit():
-    import asyncio as _aio
-    from app.db.models.models import Event as _Ev
-    def emit_sync(db, data):
-        ev = _Ev(**data.model_dump())
-        db.add(ev)
-        db.commit()
-        db.refresh(ev)
-        try:
-            loop = _aio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(broadcast_event(ev.type, {"id": ev.id, "type": ev.type}))
-        except Exception:
-            pass
-        return ev
-    event_service.emit_event_sync = emit_sync
-
-
-_patch_sync_emit()
-
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(scheduler.scheduler_loop())
-    import threading
-    threading.Thread(target=_start_background, daemon=True).start()
+        manager.disconnect(conn)

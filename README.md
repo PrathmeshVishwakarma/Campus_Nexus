@@ -6,90 +6,108 @@ Vision: [`project_overview.md`](project_overview.md) · Build plan: [`project_pl
 
 ```text
 React dashboard (Dashboard · Files · Chat · Alerts · Network)
-        │  REST + WebSocket (/api/*, /ws/events)
+        │  REST + one authenticated WebSocket (/api/*, /ws/events?token=…)
 FastAPI backend — Auth · Events · Sync · Messages · Alerts · ML
-        │  unified event bus (every action emits an Event)
-Node agents — folder watch · chunked sync · UDP discovery · heartbeat
+        │  unified event bus (every action emits an Event, delivered only to users allowed to see it)
+Node agents — folder poll · chunked sync with conflict detection · UDP discovery · heartbeat
 ```
 
 ## What works
 
 | Area | Features |
 |------|----------|
-| Dashboard | Live event timeline with search, stat tiles, quick links to every workspace |
-| Files | Folder tree, share-a-folder, 1 MB chunked upload with SHA-256 dedup, version history, full download, conflict resolve (latest / keep-mine), per-file comment threads + "Open in Chat" deep links |
-| Chat | Custom groups + 1:1 DMs with member picker, unread badges, read receipts, file threads (`/chat?file=<path>`) |
-| Alerts | Raise broadcasts with 5 priorities (Critical → Info), always-visible list with filter, ACK tracking + per-user delivery receipts, smart ranking |
+| Dashboard | Live event timeline (only events you may see) with search, stat tiles, quick links |
+| Files | One shared root with per-subfolder member ACLs, 1 MB chunked upload with SHA-256 chunk dedup, atomic commit, full version history with **restorable content**, conflict detection from the version an edit was based on, per-file discussions |
+| Chat | Groups + 1:1 DMs (one per pair), members-only access, per-user read receipts and unread counts, typing indicator, file threads (`/chat?file=<path>`) |
+| Alerts | 5 priorities (CRITICAL/URGENT need faculty, staff or admin), target everyone / roles / named people, ACK tracking + delivery receipts, learned ranking |
+| Notifications | Per-user preferences (categories, minimum alert priority, muted chats/folders, do-not-disturb, sound/toast) applied to every live event |
 | Network | Peer topology graph, scheduler queue viewer, bandwidth/congestion state, anomaly status |
-| ML safety | `IsolationForest` + mass-modify rule → auto-pause sync + banner + one-click resume |
-| Agent | Stdlib-only poller: heartbeat, change detect, chunked upload |
+| ML safety | Time-bucketed burst detection (hard rule + IsolationForest with a magnitude gate) → auto-pause sync + banner; an admin reviews and resumes |
+| Agent | Stdlib-only poller: heartbeat, change detect, chunked upload, remembers base versions for conflict detection |
+
+## Roles
+
+The **first account registered on an empty database becomes `admin`**; everyone else registers as `student`.
+Admins can change roles (`PATCH /api/auth/users/{username}/role`, roles: student · faculty · staff · admin)
+or list usernames in `ADMIN_USERNAMES` (they are promoted on startup). Admins move the root, manage
+folder ACLs, resume sync after an anomaly, and run anomaly drills.
 
 ## Quick start (local, SQLite)
 
 ```bash
 # backend
 cd backend
-python -m venv venv && source venv/bin/activate
+python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 # API docs: http://localhost:8000/docs
+# The schema is migrated to the latest Alembic revision on startup.
 
 # frontend (new terminal)
 cd frontend
-npm install && npm run dev
-# app: http://localhost:5173 (proxied /api + /ws to backend)
+npm ci && npm run dev
+# app: http://localhost:5173 (proxies /api + /ws to the backend)
 
 # node agent (new terminal, stdlib only — no venv needed)
-python agent/agent.py --folder shared/demo_files --server http://localhost:8000 \
-  --username <user> --password <pass>
+python agent/agent.py --folder ~/nexus-copy --server http://localhost:8000 --username <user>
+# password from --password, $NEXUS_PASSWORD, or a prompt
 ```
 
-Register two users → log in on two browsers → create a group/DM in Chat → upload in Files → raise an alert → watch the timeline.
+Settings live in `backend/.env` (see [`backend/.env.example`](backend/.env.example)). With no
+`SECRET_KEY`, one is generated once and kept in `backend/data/secret_key`.
 
 ## Two users, one backend
 
-Chat is client-server: both browsers talk to the **same** FastAPI backend.
-
 1. Start the backend with `--host 0.0.0.0` (or `docker compose up --build`).
 2. Both users open the same frontend URL (`http://<server-ip>:5173` on LAN).
-3. Each registers + logs in, then Chat → New → Group or 1:1 DM → send.
+3. Each registers + logs in, then Chat → New → Group or 1:1 DM → send. Messages, typing and read
+   receipts arrive live over the WebSocket.
 
-Note: chat refreshes on channel switch/send (only the Dashboard subscribes to `/ws/events` live), so the other user clicks into the channel to see new messages.
+On plain-`http` LAN addresses browsers disable `crypto.subtle`, so uploads skip chunk dedup there
+(they still work). Use `localhost` or HTTPS to get dedup.
 
 ## Docker (Postgres + backend + frontend)
 
 ```bash
+cp .env.example .env    # set SECRET_KEY (and optionally ADMIN_USERNAMES)
 docker compose up --build
-# frontend http://localhost:5173 → proxied /api + /ws to backend
+# frontend http://localhost:5173 → proxied /api + /ws to the backend
 ```
+
+The backend runs a single worker on purpose: the anomaly detector and live sockets keep
+per-process state.
 
 ## API cheat sheet
 
-`GET /health` · `POST /api/auth/register|login` · `GET /api/auth/users` · `GET /api/events`
-`POST /api/files/share` · `GET /api/files` · `GET /api/files/versions?path=` · `GET /api/files/download?path=` · `POST /api/files/resolve`
-`GET /api/sync/manifest` · `POST /api/sync/chunk` · `POST /api/sync/complete`
-`GET|POST /api/messages/channels` · `GET|POST /api/messages` · `PATCH /api/messages/{id}/read` · `GET /api/messages/unread/count`
+`GET /health` · `POST /api/auth/register|login` · `GET /api/auth/me|users` · `PATCH /api/auth/users/{u}/role` (admin)
+`GET|POST /api/events`
+`GET /api/files/tree` · `GET /api/files` · `GET|POST /api/files/root` (admin) · `GET|POST /api/files/folders` · `DELETE /api/files/item`
+`GET /api/files/versions?path=` · `GET /api/files/download?path=[&version=]` · `POST /api/files/resolve?path=&strategy=latest|keep-mine|version[&version=]`
+`GET /api/sync/manifest` · `POST /api/sync/chunk?path=&index=&total=&upload_id=` · `POST /api/sync/complete?path=&upload_id=` body `{size, base_version}`
+`GET|POST /api/messages/channels` · `GET|POST /api/messages` · `POST /api/messages/read?channel_id=` · `POST /api/messages/typing`
 `GET|POST /api/alerts` · `GET /api/alerts/ranked` · `POST /api/alerts/{id}/ack` · `GET /api/alerts/{id}/receipts`
+`GET|PATCH /api/notifications/settings`
 `GET /api/peers` · `POST /api/peers/heartbeat|discover` · `GET /api/network/graph|stats` · `GET /api/ml/anomalies`
-`POST /api/sync/report-activity` · `POST /api/sync/resume-scheduler` · `WS /ws/events`
+`POST /api/sync/report-activity` (admin drill) · `POST /api/sync/resume-scheduler` (admin) · `WS /ws/events?token=<jwt>`
 
 ## Tests
 
 ```bash
-cd backend && python -m pytest tests/ -q   # 5 passed
-cd ../frontend && npx tsc --noEmit          # clean
+cd backend && python -m pytest tests/ -q     # runs against a throwaway DB + folders
+cd ../frontend && npm run typecheck
 ```
 
 ## 5-minute demo script
 
-1. Login → Dashboard (live stats + global search).
-2. Files → share folder → upload → versions + SHA → per-file comment.
-3. Chat → New group/DM → send → unread badge + read receipts → file thread via “Open in Chat”.
-4. Alerts → CRITICAL broadcast → ACK → receipts + latency → Smart rank.
-5. `POST /api/sync/report-activity?n_modified=5000` → anomaly banner → Resume.
+1. Register the first account (admin) and a second one → Dashboard (live stats + search).
+2. Files → upload → versions + SHA → upload again from an older base → conflict → restore a version.
+3. Chat → New group/DM → send → unread badge + "Read by …" receipts → file thread via "Open in Chat".
+4. Alerts → CRITICAL alert (admin) to everyone or a role → ACK → receipts + latency → Smart rank.
+5. As admin: `POST /api/sync/report-activity?n_modified=5000` → anomaly banner → Review & Resume.
 6. Network → topology + scheduler heap + congestion state.
 
 ## Known limits / stretch
 
-- Fixed 1 MB (not content-defined) chunks · logical (not byte-level) conflict resolve ·
-  no E2E encryption · no gossip-mode failover · chat refreshes on navigation (no live WS yet) · no mobile client.
+- Fixed 1 MB (not content-defined) chunks · conflicts keep both versions and let you pick one
+  (no line-level merge) · no E2E encryption · no gossip-mode failover · no mobile client ·
+  `email_digest` is stored but no mail is sent.

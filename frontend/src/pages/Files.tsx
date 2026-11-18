@@ -7,7 +7,7 @@ import {
   Settings2, Users, Activity, Plus,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { api, useAuth } from '../store/useAuth'
+import { api, authFetch, useAuth } from '../store/useAuth'
 import { Card } from '../components/ui/card'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
@@ -15,7 +15,7 @@ import { Input } from '../components/ui/input'
 type TreeFile = { name: string; path: string; type: 'file'; size: number; version: number; hash: string; modified_by: string }
 type TreeDir = { name: string; path: string; type: 'dir'; children: TreeNode[]; locked?: boolean; members?: string[] }
 type TreeNode = TreeFile | TreeDir
-type Version = { version: number; hash: string; size: number; by: string; at: string; chunks: unknown; clock: Record<string, number> }
+type Version = { version: number; hash: string; size: number; by: string; at: string; chunks: unknown; clock: Record<string, number>; restorable?: boolean }
 type AuditItem = { id: string; type: string; actor: string; resource: string; priority: number; payload: any; timestamp: string }
 type FolderInfo = { name: string; path: string; members: string[]; locked: boolean; files: number }
 type UserItem = { username: string; email: string; role: string }
@@ -23,7 +23,15 @@ type DiffItem = { path: string; status: 'new' | 'unchanged' | 'changed' | 'inval
 
 const CHUNK = 1024 * 1024
 
+// crypto.subtle / randomUUID only exist in secure contexts (https or localhost).
+// On plain-http LAN access we skip hashing (no dedup) instead of failing.
+function newUploadId() {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID().replace(/-/g, '')
+  return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
+}
+
 async function sha256Blob(blob: Blob): Promise<string> {
+  if (typeof crypto === 'undefined' || !crypto.subtle) return ''
   const buf = await blob.arrayBuffer()
   const digest = await crypto.subtle.digest('SHA-256', buf)
   return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('')
@@ -127,11 +135,16 @@ export default function Files() {
   // ---- actions ----
   const uploadOne = async (file: File, rel: string, onChunk?: (pct: number) => void) => {
     const total = Math.max(1, Math.ceil(file.size / CHUNK))
+    const uploadId = newUploadId()
     let existing: string[] = []
+    // A browser upload is an explicit overwrite of what the user just saw on the
+    // server, so its base is the server's current version (agents send their own).
+    let baseVersion: number | undefined
     try {
       const m = await api(`/api/sync/manifest?path=${encodeURIComponent(rel)}`, auth)
       if (m.exists && Array.isArray(m.chunks)) existing = m.chunks.map((c: any) => c.hash as string)
-    } catch { /* full upload */ }
+      if (typeof m.version === 'number' && m.version > 0) baseVersion = m.version
+    } catch (e: any) { if (e?.status === 403) throw e /* else: full upload */ }
     let skipped = 0
     for (let i = 0; i < total; i++) {
       const piece = file.slice(i * CHUNK, (i + 1) * CHUNK)
@@ -141,13 +154,15 @@ export default function Files() {
       }
       const form = new FormData()
       form.append('file', piece, file.name)
-      const res = await fetch(`/api/sync/chunk?path=${encodeURIComponent(rel)}&index=${i}&total=${total}`, {
-        method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form,
+      await authFetch(`/api/sync/chunk?path=${encodeURIComponent(rel)}&index=${i}&total=${total}&upload_id=${uploadId}`, {
+        method: 'POST', body: form,
       })
-      if (!res.ok) throw new Error(await res.text())
       onChunk?.(Math.round(((i + 1) / total) * 100))
     }
-    const done = await api(`/api/sync/complete?path=${encodeURIComponent(rel)}`, { ...auth, method: 'POST', body: JSON.stringify({}) })
+    const done = await api(`/api/sync/complete?path=${encodeURIComponent(rel)}&upload_id=${uploadId}`, {
+      ...auth, method: 'POST', body: JSON.stringify({ size: file.size, base_version: baseVersion }),
+    })
+    if (done?.conflict) toast.warning(`${rel}: saved as v${done.version}, but someone else changed it meanwhile — review Versions`)
     return { rel, version: done?.version, deduped: done?.deduped, skipped, total }
   }
 
@@ -184,22 +199,22 @@ export default function Files() {
     } catch (e: any) { toast.error(e.message, { duration: 6000 }) }
   }
 
-  const downloadFile = async (path: string) => {    try {
-      const res = await fetch(`/api/files/download?path=${encodeURIComponent(path)}`, { headers: { Authorization: `Bearer ${token}` } })
-      if (!res.ok) throw new Error(await res.text())
+  const downloadFile = async (path: string, version?: number) => {    try {
+      const res = await authFetch(`/api/files/download?path=${encodeURIComponent(path)}${version ? `&version=${version}` : ''}`)
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
-      a.href = url; a.download = path.split('/').pop() || 'file'; a.click()
+      a.href = url; a.download = (version ? `v${version}_` : '') + (path.split('/').pop() || 'file'); a.click()
       URL.revokeObjectURL(url)
     } catch (e: any) { toast.error(e.message) }
   }
 
-  const resolve = async (path: string, strategy: string) => {
+  const resolve = async (path: string, strategy: string, version?: number) => {
     try {
-      const res = await api(`/api/files/resolve?path=${encodeURIComponent(path)}&strategy=${strategy}`, { ...auth, method: 'POST', body: JSON.stringify({}) })
-      toast.success(`Conflict resolved → v${res.winner_version} by ${res.by}`)
-      loadDetail(path)
+      const q = version ? `&version=${version}` : ''
+      const res = await api(`/api/files/resolve?path=${encodeURIComponent(path)}&strategy=${strategy}${q}`, { ...auth, method: 'POST' })
+      toast.success(res.restored ? `Restored v${res.winner_version} (by ${res.by}) as v${res.version}` : `Kept v${res.winner_version} by ${res.by}`)
+      loadDetail(path); load()
     } catch (e: any) { toast.error(e.message) }
   }
 
@@ -377,9 +392,11 @@ export default function Files() {
         <div className="ml-auto flex items-center gap-2 flex-wrap">
           <Input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search files…" aria-label="Search files" className="w-44" />
           <Button variant="secondary" onClick={load} title="Refresh"><RefreshCw size={15} /></Button>
-          <Button variant="secondary" onClick={() => reveal()} title="Open shared root in Finder / File Explorer (server machine)">
-            <span className="flex items-center gap-1.5"><FolderSearch size={14} /> Finder</span>
-          </Button>
+          {isAdmin && (
+            <Button variant="secondary" onClick={() => reveal()} title="Open shared root in Finder / File Explorer (server machine)">
+              <span className="flex items-center gap-1.5"><FolderSearch size={14} /> Finder</span>
+            </Button>
+          )}
           <Button variant="secondary" onClick={() => { setUploadDir(selectedDir); setUploadMode('choose'); setUploadNew(''); setShowUpload(true) }}>
             <span className="flex items-center gap-1.5"><Upload size={14} /> Upload</span>
           </Button>
@@ -428,7 +445,7 @@ export default function Files() {
                   <p className="text-xs text-[var(--muted)] truncate">{selected}</p>
                 </div>
                 <div className="ml-auto flex gap-2 flex-wrap">
-                  <Button variant="secondary" onClick={() => reveal(selected)} title="Reveal in Finder / File Explorer (server machine)"><span className="flex items-center gap-1.5"><FolderSearch size={14} /> Reveal</span></Button>
+                  {isAdmin && <Button variant="secondary" onClick={() => reveal(selected)} title="Reveal in Finder / File Explorer (server machine)"><span className="flex items-center gap-1.5"><FolderSearch size={14} /> Reveal</span></Button>}
                   <Button onClick={() => downloadFile(selected)}><span className="flex items-center gap-1.5"><Download size={14} /> Download</span></Button>
                   <Link to={`/files/discussion?path=${encodeURIComponent(selected)}`}>
                     <Button variant="secondary"><span className="flex items-center gap-1.5"><MessageSquare size={14} /> Discuss</span></Button>
@@ -451,6 +468,14 @@ export default function Files() {
                           <span className="text-[var(--muted)]">{v.size} bytes · by {v.by}</span>
                           <span className="ml-auto text-[var(--muted)]">{new Date(v.at).toLocaleString()}</span>
                         </div>
+                        {v.restorable && (
+                          <div className="flex gap-2 mt-1.5">
+                            <button className="text-[var(--accent)] hover:underline" onClick={() => downloadFile(selected, v.version)}>Download v{v.version}</button>
+                            {v.version !== versions[versions.length - 1]?.version && (
+                              <button className="text-[var(--accent)] hover:underline" onClick={() => resolve(selected, 'version', v.version)}>Restore this version</button>
+                            )}
+                          </div>
+                        )}
                       </div>
                     ))}
                     {versions.length === 0 && <p className="text-xs text-[var(--muted)]">No versions recorded yet.</p>}

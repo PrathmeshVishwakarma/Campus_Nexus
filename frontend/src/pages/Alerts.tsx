@@ -8,9 +8,9 @@ import { Input } from '../components/ui/input'
 
 type AlertItem = {
   id: string; title: string; body: string; priority: string; sender: string;
-  created_at: string; acked: number; total: number; acked_by_me: boolean; score?: number;
+  created_at: string; acked: number; total: number; acked_by_me: boolean; score?: number; target_scope?: string; method?: string;
 }
-type Receipt = { user: string; delivered_at: string; acked_at: string | null; latency_ms: number }
+type Receipt = { user: string; delivered_at: string; acked_at: string | null; latency_ms: number | null }
 
 const PRIORITIES = ['ALL', 'CRITICAL', 'URGENT', 'IMPORTANT', 'NORMAL', 'INFO'] as const
 type PriorityFilter = typeof PRIORITIES[number]
@@ -26,9 +26,18 @@ const tabColor: Record<string, string> = {
 }
 
 export default function Alerts() {
-  const { token } = useAuth()
+  const { token, role } = useAuth()
+  // CRITICAL / URGENT are reserved for staff, faculty and admins (enforced server-side)
+  const canHigh = ['admin', 'faculty', 'staff'].includes(role)
+  const allowed = (['CRITICAL', 'URGENT', 'IMPORTANT', 'NORMAL', 'INFO'] as const)
+    .filter(p => canHigh || (p !== 'CRITICAL' && p !== 'URGENT'))
   const [alerts, setAlerts] = useState<AlertItem[]>([])
-  const [form, setForm] = useState({ title: '', body: '', priority: 'URGENT' })
+  const [form, setForm] = useState({ title: '', body: '', priority: 'IMPORTANT' })
+  const [scopeKind, setScopeKind] = useState<'all' | 'role' | 'users'>('all')
+  const [scopeRoles, setScopeRoles] = useState<string[]>([])
+  const [scopeUsers, setScopeUsers] = useState<string[]>([])
+  const [users, setUsers] = useState<{ username: string }[]>([])
+  useEffect(() => { api('/api/auth/users').then(setUsers).catch(() => {}) }, [])
   const [filter, setFilter] = useState<PriorityFilter>('ALL')
   const [ranked, setRanked] = useState(false)
   const [receipts, setReceipts] = useState<Record<string, Receipt[]>>({})
@@ -58,10 +67,18 @@ export default function Alerts() {
 
   const create = async () => {
     if (!form.title.trim()) return toast.error('Title required')
+    let target_scope = 'all'
+    if (scopeKind === 'role') {
+      if (!scopeRoles.length) return toast.error('Pick at least one role')
+      target_scope = `role:${scopeRoles.join(',')}`
+    } else if (scopeKind === 'users') {
+      if (!scopeUsers.length) return toast.error('Pick at least one person')
+      target_scope = `users:${scopeUsers.join(',')}`
+    }
     try {
-      await api('/api/alerts', { ...auth, method: 'POST', body: JSON.stringify({ ...form, target_scope: 'all' }) })
-      setForm({ title: '', body: '', priority: 'URGENT' })
-      toast.success('Alert broadcast — receipts created for every user')
+      await api('/api/alerts', { ...auth, method: 'POST', body: JSON.stringify({ ...form, target_scope }) })
+      setForm({ title: '', body: '', priority: 'IMPORTANT' })
+      toast.success(target_scope === 'all' ? 'Alert broadcast to everyone' : `Alert sent to ${target_scope}`)
       load()
     } catch (e: any) { toast.error(e.message) }
   }
@@ -110,7 +127,7 @@ export default function Alerts() {
     <div className="mx-auto w-full max-w-5xl px-4 sm:px-6 py-6 grid md:grid-cols-2 gap-4 items-start">
       <Card>
         <h2 className="text-lg font-bold flex items-center gap-2 mb-1"><Bell size={17} className="text-[var(--accent)]" /> Raise an alert</h2>
-        <p className="text-xs text-[var(--muted)] mb-3">Broadcasts to every node. Delivery receipts are created per user; ask them to ACK.</p>
+        <p className="text-xs text-[var(--muted)] mb-3">Send to everyone, some roles or named people. Each recipient gets a delivery receipt to ACK.</p>
         <div className="space-y-2">
           <Input value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} placeholder="Title (e.g. Fire drill, Building B)" aria-label="Alert title" />
           <textarea
@@ -121,7 +138,7 @@ export default function Alerts() {
           />
           {/* Priority selector buttons (reused in form) */}
           <div className="flex flex-wrap gap-1.5">
-            {(['CRITICAL', 'URGENT', 'IMPORTANT', 'NORMAL', 'INFO'] as const).map(p => (
+            {allowed.map(p => (
               <button
                 key={p}
                 onClick={() => setForm({ ...form, priority: p })}
@@ -131,7 +148,36 @@ export default function Alerts() {
               </button>
             ))}
           </div>
-          <Button onClick={create} className="w-full">Broadcast {form.priority} alert</Button>
+          <div className="flex flex-wrap gap-1.5 text-xs items-center">
+            <span className="text-[var(--muted)]">Send to</span>
+            {(['all', 'role', 'users'] as const).map(k => (
+              <button key={k} onClick={() => setScopeKind(k)}
+                className={`rounded-lg px-2.5 py-1 border ${scopeKind === k ? 'border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--muted)]'}`}>
+                {k === 'all' ? 'Everyone' : k === 'role' ? 'Roles' : 'People'}
+              </button>
+            ))}
+          </div>
+          {scopeKind === 'role' && (
+            <div className="flex flex-wrap gap-1.5 text-xs">
+              {['student', 'faculty', 'staff', 'admin'].map(r => (
+                <label key={r} className="flex items-center gap-1">
+                  <input type="checkbox" checked={scopeRoles.includes(r)}
+                    onChange={() => setScopeRoles(v => v.includes(r) ? v.filter(x => x !== r) : [...v, r])} /> {r}
+                </label>
+              ))}
+            </div>
+          )}
+          {scopeKind === 'users' && (
+            <div className="flex flex-wrap gap-1.5 text-xs max-h-24 overflow-auto">
+              {users.map(u => (
+                <label key={u.username} className="flex items-center gap-1">
+                  <input type="checkbox" checked={scopeUsers.includes(u.username)}
+                    onChange={() => setScopeUsers(v => v.includes(u.username) ? v.filter(x => x !== u.username) : [...v, u.username])} /> {u.username}
+                </label>
+              ))}
+            </div>
+          )}
+          <Button onClick={create} className="w-full">Send {form.priority} alert</Button>
         </div>
       </Card>
 

@@ -4,12 +4,13 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { MoreVertical, Pencil, Plus, Send, Trash2, UserCheck, UserMinus, UserPlus, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, useAuth } from '../store/useAuth'
+import { useNexusEvents } from '../hooks/useNexusEvents'
 import { Card } from '../components/ui/card'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 
-type Ch = { id: number; name: string; type: string; members: string[] }
-type M = { id: number; sender: string; content: string; file_link: string; read: boolean; created_at: string }
+type Ch = { id: number; name: string; type: string; members: string[]; created_by?: string | null; unread?: number }
+type M = { id: number; sender: string; content: string; file_link: string; read: boolean; read_by?: string[]; read_by_all?: boolean; created_at: string }
 type User = { username: string; email: string }
 
 export default function Chat() {
@@ -62,6 +63,8 @@ export default function Chat() {
   }, [msgs, cid])
 
   const auth = { headers: { Authorization: `Bearer ${token}` } }
+  const cidRef = useRef(cid)
+  cidRef.current = cid
 
   const loadUsers = async () => {
     try { setUsers(await api('/api/auth/users', auth)) } catch { /* optional */ }
@@ -71,15 +74,11 @@ export default function Chat() {
     try {
       const res: Ch[] = await api('/api/messages/channels', auth)
       setChannels(res)
-      if (!cid && res[0]) setCid(res[0].id)
-      // unread badges
+      if (!cidRef.current && res[0]) setCid(res[0].id)
+      if (cidRef.current && !res.some(c => c.id === cidRef.current)) { setCid(res[0]?.id ?? null); setMsgs([]) }
+      // unread badges come with the channel list (one request, not one per channel)
       const counts: Record<number, number> = {}
-      await Promise.all(res.map(async c => {
-        try {
-          const r = await api(`/api/messages/unread/count?channel_id=${c.id}`, auth)
-          counts[c.id] = r.unread ?? 0
-        } catch { counts[c.id] = 0 }
-      }))
+      res.forEach(c => { counts[c.id] = c.unread ?? 0 })
       setUnread(counts)
     } catch (e: any) { if (!silent) toast.error(e.message) }
   }
@@ -102,8 +101,6 @@ export default function Chat() {
 
   // Refs so one long-lived socket/interval always sees the current selection
   // without reconnecting on every channel switch.
-  const cidRef = useRef(cid)
-  cidRef.current = cid
   const fileRef = useRef(fileFilter)
   fileRef.current = fileFilter
   const userRef = useRef(user)
@@ -121,81 +118,40 @@ export default function Chat() {
   const loadMsgRef = useRef(loadMsg)
   loadMsgRef.current = loadMsg
 
-  // Live updates: WebSocket MESSAGE_SENT events for instant refresh,
-  // plus a quiet 4s poll as fallback if the socket drops.
-  useEffect(() => {
-    let alive = true
-    let ws: WebSocket | null = null
-    let retry = 0
-    let retryTimer: ReturnType<typeof setTimeout> | null = null
-    let pingTimer: ReturnType<typeof setInterval> | null = null
-    const onEvent = (raw: string) => {
-      try {
-        const e = JSON.parse(raw)
-        if (e.event === 'TYPING') {
-          const chId = e.data?.payload?.channel_id ?? e.data?.channel_id
-          const actor: string = e.data?.actor || ''
-          if (chId === cidRef.current && actor !== userRef.current) {
-            setTypingUsers(prev => ({ ...prev, [actor]: true }))
-            clearTimeout(typingTimers.current[actor])
-            typingTimers.current[actor] = setTimeout(() => {
-              setTypingUsers(prev => { const n = { ...prev }; delete n[actor]; return n })
-            }, 3000)
-          }
-          return
-        }
-        if (e.event === 'PONG') return
-        if (e.event !== 'MESSAGE_SENT') return
-        const resource: string = e.data?.resource || ''
-        const m = resource.match(/^channel:(\d+)/)
-        // channel list can change on any message event (new/renamed/deleted channel)
-        loadChRef.current(true)
-        if (m && Number(m[1]) === cidRef.current) loadMsgRef.current(true)
-      } catch { /* ignore malformed frames */ }
-    };
-    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
-    const connect = () => {
-      if (!alive) return
-      try {
-        ws = new WebSocket(`${scheme}://${location.host}/ws/events?token=${token}`)
-      } catch { scheduleRetry(); return }
-      ws.onopen = () => { retry = 0 }
-      ws.onmessage = (msg) => { if (alive) onEvent(msg.data) }
-      ws.onerror = () => { try { ws?.close() } catch {} }
-      ws.onclose = () => { scheduleRetry() }
-    }
-    const scheduleRetry = () => {
-      if (!alive) return
-      if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
-      retry = Math.min(retry + 1, 5)
-      const delay = Math.min(1000 * 2 ** retry, 10000)
-      if (retryTimer) clearTimeout(retryTimer)
-      retryTimer = setTimeout(() => { if (alive) connect() }, delay)
-    }
-    connect()
-    // heartbeat keeps Vite's dev proxy + idle connections alive
-    pingTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try { ws.send(JSON.stringify({ action: 'PING' })) } catch {}
+  // Live updates over the app's single shared socket. The server only sends
+  // events for channels this user belongs to. Poll only while it is down.
+  const { connected } = useNexusEvents((e) => {
+    if (e.event === 'TYPING') {
+      const chId = e.data?.payload?.channel_id
+      const actor: string = e.data?.actor || ''
+      if (chId === cidRef.current && actor !== userRef.current) {
+        setTypingUsers(prev => ({ ...prev, [actor]: true }))
+        clearTimeout(typingTimers.current[actor])
+        typingTimers.current[actor] = setTimeout(() => {
+          setTypingUsers(prev => { const n = { ...prev }; delete n[actor]; return n })
+        }, 3000)
       }
-    }, 25000)
-    const poll = setInterval(() => {
-      if (alive && !document.hidden) { loadChRef.current(true); loadMsgRef.current(true) }
-    }, 4000)
-    return () => {
-      alive = false
-      clearInterval(poll)
-      if (pingTimer) clearInterval(pingTimer)
-      if (retryTimer) clearTimeout(retryTimer)
-      try { ws?.close() } catch {}
+      return
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token])
+    if (e.event !== 'MESSAGE_SENT' && e.event !== 'MESSAGE_READ') return
+    const m = (e.data?.resource || '').match(/^channel:(\d+)/)
+    loadChRef.current(true)
+    if (m && Number(m[1]) === cidRef.current) loadMsgRef.current(true)
+  }, token)
 
   useEffect(() => {
-    msgs.filter(m => !m.read && m.sender !== user).forEach(m => {
-      api(`/api/messages/${m.id}/read`, { ...auth, method: 'PATCH' }).catch(() => {})
-    })
+    if (connected) return
+    const poll = setInterval(() => {
+      if (!document.hidden) { loadChRef.current(true); loadMsgRef.current(true) }
+    }, 5000)
+    return () => clearInterval(poll)
+  }, [connected])
+
+  // mark the open channel read in one call when unread messages from others are shown
+  useEffect(() => {
+    if (!cid || !msgs.some(m => !m.read && m.sender !== user)) return
+    api(`/api/messages/read?channel_id=${cid}`, { ...auth, method: 'POST' })
+      .then(() => setUnread(u => ({ ...u, [cid]: 0 }))).catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [msgs])
 
@@ -418,7 +374,7 @@ export default function Chat() {
                       <span
                         className="font-bold"
                         style={{ color: m.read ? 'var(--accent)' : 'var(--muted)' }}
-                        title={m.read ? 'Read' : 'Delivered'}
+                        title={m.read_by && m.read_by.length ? `Read by ${m.read_by.join(', ')}${m.read_by_all ? ' (everyone)' : ''}` : 'Delivered'}
                       >
                         {m.read ? '✓✓' : '✓'}
                       </span>
