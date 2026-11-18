@@ -32,6 +32,12 @@ CHUNK = 1024 * 1024
 HELLO_PORT = 9999
 STATE_FILE = ".nexus_agent_state.json"
 
+# AIMD Congestion Control Parameters (RFC 5681 inspired)
+AIMD_CONGESTION_DELAY = 0.0      # Current inter-chunk backoff delay (seconds)
+AIMD_RTT_THRESHOLD_MS = 250.0    # RTT threshold indicating bufferbloat / link saturation
+AIMD_MIN_DELAY = 0.0
+AIMD_MAX_DELAY = 3.0
+
 
 class AuthError(RuntimeError):
     pass
@@ -78,6 +84,7 @@ def post_multipart(server, path, query, token, field_name, filename, chunk_bytes
     try:
         conn.request("POST", u.path + ("?" + u.query if u.query else ""), body, headers)
         resp = conn.getresponse()
+        ecn_header = resp.getheader("X-Congestion", "0")
         data = resp.read().decode()
     finally:
         conn.close()
@@ -85,7 +92,10 @@ def post_multipart(server, path, query, token, field_name, filename, chunk_bytes
         raise AuthError(data[:200])
     if resp.status >= 400:
         raise RuntimeError(f"chunk upload {resp.status}: {data[:200]}")
-    return json.loads(data or "{}")
+    res = json.loads(data or "{}")
+    if ecn_header == "1":
+        res["congested"] = True
+    return res
 
 
 def sha(b: bytes) -> str:
@@ -98,6 +108,7 @@ def q(rel: str) -> str:
 
 def upload_file(server, token, folder: Path, rel: str, base_version: int | None):
     """Upload one file; returns the server's response to /sync/complete."""
+    global AIMD_CONGESTION_DELAY
     data = (folder / rel).read_bytes()
     total = max(1, -(-len(data) // CHUNK))
     man = api(server, "GET", "/api/sync/manifest", token, query=f"?path={q(rel)}")
@@ -110,9 +121,29 @@ def upload_file(server, token, folder: Path, rel: str, base_version: int | None)
         piece = data[i * CHUNK:(i + 1) * CHUNK]
         if i < len(existing) and existing[i] == sha(piece):
             continue
-        post_multipart(server, "/api/sync/chunk",
-                       f"?path={q(rel)}&index={i}&total={total}&upload_id={upload_id}",
-                       token, "file", Path(rel).name, piece)
+
+        t0 = time.time()
+        chunk_res = post_multipart(server, "/api/sync/chunk",
+                                   f"?path={q(rel)}&index={i}&total={total}&upload_id={upload_id}",
+                                   token, "file", Path(rel).name, piece)
+        rtt_ms = (time.time() - t0) * 1000.0
+
+        # Congestion detection via Explicit Congestion Notification (ECN) or high RTT
+        is_congested = chunk_res.get("congested", False) or (rtt_ms > AIMD_RTT_THRESHOLD_MS)
+        if is_congested:
+            # Multiplicative Decrease: throttle aggressively to clear queue
+            AIMD_CONGESTION_DELAY = min(AIMD_MAX_DELAY, max(0.3, (AIMD_CONGESTION_DELAY + 0.1) * 2.0))
+            print(f"[AIMD CONGESTION] Chunk {i+1}/{total} RTT={rtt_ms:.1f}ms (ECN={chunk_res.get('congested', False)}). "
+                  f"Multiplicative Decrease -> Throttle delay={AIMD_CONGESTION_DELAY:.2f}s")
+        else:
+            # Additive Increase: carefully reduce delay to probe for bandwidth
+            if AIMD_CONGESTION_DELAY > 0:
+                AIMD_CONGESTION_DELAY = max(AIMD_MIN_DELAY, AIMD_CONGESTION_DELAY - 0.05)
+                print(f"[AIMD RECOVERY] Chunk {i+1}/{total} RTT={rtt_ms:.1f}ms. "
+                      f"Additive Increase -> Throttle delay={AIMD_CONGESTION_DELAY:.2f}s")
+
+        if AIMD_CONGESTION_DELAY > 0:
+            time.sleep(AIMD_CONGESTION_DELAY)
     body = {"size": len(data)}
     if base_version:
         body["base_version"] = base_version

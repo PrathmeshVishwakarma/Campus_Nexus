@@ -26,7 +26,18 @@ type GraphData = {
 }
 type Stats = {
   scheduler_queue: { label: string; priority: number }[]
-  throttle: { congested: boolean; bps: number; paused: boolean } | null
+  throttle: {
+    congested: boolean
+    bps: number
+    paused: boolean
+    token_bucket?: {
+      rate: number
+      capacity: number
+      tokens: number
+      simulated_congestion: boolean
+      is_congested: boolean
+    }
+  } | null
   net_io: { bytes_sent: number; dropin?: number; dropout?: number }
 }
 
@@ -34,7 +45,29 @@ export default function Network() {
   const { token } = useAuth()
   const [graph, setGraph] = useState<GraphData | null>(null)
   const [stats, setStats] = useState<Stats | null>(null)
+  const [toggling, setToggling] = useState(false)
   const graphJson = useRef('')
+
+  const toggleCongestion = async () => {
+    setToggling(true)
+    const currentlySimulated = !!stats?.throttle?.token_bucket?.simulated_congestion
+    try {
+      await api('/api/network/congestion', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ congested: !currentlySimulated })
+      })
+      toast.success(!currentlySimulated ? 'Simulated Congestion ON: AIMD Backoff activated' : 'Congestion cleared: Full line speed restored')
+      await load()
+    } catch (e: any) {
+      toast.error(e.message)
+    } finally {
+      setToggling(false)
+    }
+  }
 
   const load = async () => {
     try {
@@ -206,6 +239,91 @@ export default function Network() {
               {(!stats?.scheduler_queue || stats.scheduler_queue.length === 0) && (
                 <p className="text-xs text-[var(--muted)] text-center py-4">Queue empty</p>
               )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Congestion Control & Traffic Shaper Card */}
+      <div className="rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <div className="flex items-center gap-2">
+            <span className="font-semibold text-base">QoS & Congestion Control</span>
+            <span className="text-xs px-2 py-0.5 rounded-full border border-[var(--border)] text-[var(--muted)]">
+              Token Bucket + AIMD
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span
+              className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ${
+                stats?.throttle?.congested
+                  ? 'bg-red-500/10 text-red-500 border border-red-500/20'
+                  : 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/20'
+              }`}
+            >
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  stats?.throttle?.congested ? 'bg-red-500 animate-pulse' : 'bg-emerald-500'
+                }`}
+              />
+              {stats?.throttle?.congested ? 'CONGESTED (AIMD Backoff)' : 'OPTIMAL (Full Speed)'}
+            </span>
+            <button
+              onClick={toggleCongestion}
+              disabled={toggling}
+              className={`text-xs px-3 py-1.5 rounded-lg font-medium transition-all cursor-pointer ${
+                stats?.throttle?.token_bucket?.simulated_congestion
+                  ? 'bg-red-600 text-white hover:bg-red-700'
+                  : 'bg-[var(--card-hover)] hover:bg-[var(--border)] text-[var(--foreground)] border border-[var(--border)]'
+              }`}
+            >
+              {stats?.throttle?.token_bucket?.simulated_congestion ? 'Clear Simulated Congestion' : 'Simulate Network Congestion'}
+            </button>
+          </div>
+        </div>
+
+        <div className="grid sm:grid-cols-3 gap-3 text-xs">
+          <div className="p-3 rounded-xl bg-[var(--card-hover)] border border-[var(--border)]">
+            <div className="text-[var(--muted)] mb-1">Token Bucket Level</div>
+            <div className="text-lg font-bold">
+              {stats?.throttle?.token_bucket ? `${stats.throttle.token_bucket.tokens} / ${stats.throttle.token_bucket.capacity}` : '10 / 10'}{' '}
+              <span className="text-xs font-normal text-[var(--muted)]">tokens</span>
+            </div>
+            <div className="w-full h-1.5 rounded-full bg-[var(--border)] mt-2 overflow-hidden">
+              <div
+                className="h-full bg-[var(--accent)] transition-all"
+                style={{
+                  width: `${Math.min(
+                    100,
+                    (((stats?.throttle?.token_bucket?.tokens || 10) / (stats?.throttle?.token_bucket?.capacity || 10)) * 100)
+                  )}%`
+                }}
+              />
+            </div>
+          </div>
+
+          <div className="p-3 rounded-xl bg-[var(--card-hover)] border border-[var(--border)]">
+            <div className="text-[var(--muted)] mb-1">Token Generation Rate</div>
+            <div className="text-lg font-bold">
+              {stats?.throttle?.token_bucket?.rate || 5.0}{' '}
+              <span className="text-xs font-normal text-[var(--muted)]">chunks/sec (~5 MB/s)</span>
+            </div>
+            <p className="text-[10px] text-[var(--muted)] mt-2">
+              Sustained rate limit for bulk file synchronization
+            </p>
+          </div>
+
+          <div className="p-3 rounded-xl bg-[var(--card-hover)] border border-[var(--border)]">
+            <div className="text-[var(--muted)] mb-1">QoS Priority Policies</div>
+            <div className="space-y-1 mt-1 text-[11px]">
+              <div className="flex justify-between">
+                <span>P &ge; 80 (Alerts/Chat):</span>
+                <span className="font-semibold text-emerald-500">Bypass (0 ms)</span>
+              </div>
+              <div className="flex justify-between">
+                <span>P &lt; 60 (File Chunks):</span>
+                <span className="font-semibold text-amber-500">AIMD Throttled</span>
+              </div>
             </div>
           </div>
         </div>

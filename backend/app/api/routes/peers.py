@@ -22,6 +22,12 @@ class Heartbeat(BaseModel):
     latency_ms: float = Field(default=0.0, ge=0)
 
 
+class CongestionSimulationRequest(BaseModel):
+    congested: bool
+    rate: float | None = None
+    capacity: float | None = None
+
+
 def mark_stale(db: Session) -> list[Peer]:
     peers = db.query(Peer).all()
     now = utcnow()
@@ -92,6 +98,21 @@ def graph(user=Depends(get_current_user)):
 def stats(user=Depends(get_current_user)):
     return {"net_io": net_io_snapshot(), "scheduler_queue": scheduler.pending(),
             "throttle": scheduler.throttle_status()}
+
+
+@router.post("/network/congestion")
+def set_congestion(data: CongestionSimulationRequest, user=Depends(get_current_user)):
+    """Simulate or reset network congestion for live demonstrations and testing."""
+    scheduler.token_bucket.set_simulated_congestion(data.congested)
+    if data.rate is not None and data.rate > 0:
+        scheduler.token_bucket.rate = data.rate
+    if data.capacity is not None and data.capacity > 0:
+        scheduler.token_bucket.capacity = data.capacity
+    return {
+        "ok": True,
+        "congested": scheduler.token_bucket.is_congested(),
+        "throttle": scheduler.throttle_status(),
+    }
 
 
 @router.get("/ml/anomalies")
