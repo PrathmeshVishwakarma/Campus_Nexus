@@ -2,16 +2,16 @@ import React, { useEffect, useRef, useState } from 'react'
 import { Bell, CheckCheck, ChevronDown } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, useAuth } from '../store/useAuth'
+import { useNexusEvents } from '../hooks/useNexusEvents'
 import { Card } from '../components/ui/card'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 
 type AlertItem = {
   id: string; title: string; body: string; priority: string; sender: string;
-  created_at: string; acked: number; total: number; acked_by_me: boolean; score?: number;
+  created_at: string; acked: number; total: number; acked_by_me: boolean; score?: number; target_scope?: string; method?: string; below_threshold?: boolean;
 }
-type Receipt = { user: string; delivered_at: string; acked_at: string | null; latency_ms: number }
-type UserItem = { username: string; email: string; role: string }
+type Receipt = { user: string; delivered_at: string; acked_at: string | null; latency_ms: number | null }
 
 const PRIORITIES = ['ALL', 'CRITICAL', 'URGENT', 'IMPORTANT', 'NORMAL', 'INFO'] as const
 type PriorityFilter = typeof PRIORITIES[number]
@@ -27,128 +27,73 @@ const tabColor: Record<string, string> = {
 }
 
 export default function Alerts() {
-  const { token, user } = useAuth()
+  const { token, role, user } = useAuth()
+  // CRITICAL / URGENT are reserved for staff, faculty and admins (enforced server-side)
+  const canHigh = ['admin', 'faculty', 'staff'].includes(role)
+  const allowed = (['CRITICAL', 'URGENT', 'IMPORTANT', 'NORMAL', 'INFO'] as const)
+    .filter(p => canHigh || (p !== 'CRITICAL' && p !== 'URGENT'))
   const [alerts, setAlerts] = useState<AlertItem[]>([])
-  const [form, setForm] = useState({ title: '', body: '', priority: 'URGENT' })
+  const [form, setForm] = useState({ title: '', body: '', priority: 'IMPORTANT' })
+  const [scopeKind, setScopeKind] = useState<'all' | 'role' | 'users'>('all')
+  const [scopeRoles, setScopeRoles] = useState<string[]>([])
+  const [scopeUsers, setScopeUsers] = useState<string[]>([])
+  const [users, setUsers] = useState<{ username: string }[]>([])
+  useEffect(() => { api('/api/auth/users').then(setUsers).catch(() => {}) }, [])
   const [filter, setFilter] = useState<PriorityFilter>('ALL')
   const [ranked, setRanked] = useState(false)
   const [receipts, setReceipts] = useState<Record<string, Receipt[]>>({})
   const [openReceipts, setOpenReceipts] = useState<Record<string, boolean>>({})
-  const [users, setUsers] = useState<UserItem[]>([])
-  const [targets, setTargets] = useState<string[]>([])
 
   const auth = { headers: { Authorization: `Bearer ${token}` } }
 
-  const load = async (silent = false) => {
+  // reloads keep the current view (filtered list or smart rank)
+  const load = async (silent = false, rankedView = ranked) => {
     try {
-      const res = filter !== 'ALL'
-        ? await api(`/api/alerts?priority=${filter}`, auth)
-        : await api('/api/alerts', auth)
+      const res = rankedView
+        ? await api('/api/alerts/ranked', auth)
+        : filter !== 'ALL' ? await api(`/api/alerts?priority=${filter}`, auth) : await api('/api/alerts', auth)
       setAlerts(res)
-      setRanked(false)
     } catch (e: any) { if (!silent) toast.error(e.message) }
   }
 
-  useEffect(() => { load() }, [])
-  useEffect(() => { load() }, [filter])
-  useEffect(() => {
-    api('/api/auth/users', auth).then(setUsers).catch(() => {})
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token])
+  useEffect(() => { setRanked(false); load(false, false) }, [filter])
 
-  // Live refresh: alert broadcasts/acks reload the list + open receipts.
-  const loadRef = useRef(load)
-  loadRef.current = load
-  const receiptsRef = useRef(receipts)
-  receiptsRef.current = receipts
-  const openRef = useRef(openReceipts)
-  openRef.current = openReceipts
-
-  useEffect(() => {
-    if (!token) return
-    let alive = true
-    let ws: WebSocket | null = null
-    let retry = 0
-    let retryTimer: ReturnType<typeof setTimeout> | null = null
-    let pingTimer: ReturnType<typeof setInterval> | null = null
-    let reloadTimer: ReturnType<typeof setTimeout> | null = null
-
-    const refresh = () => {
-      if (reloadTimer) clearTimeout(reloadTimer)
-      reloadTimer = setTimeout(async () => {
-        loadRef.current(true)
-        for (const id of Object.keys(openRef.current)) {
-          if (!openRef.current[id]) continue
-          try {
-            const rows = await api(`/api/alerts/${id}/receipts`, auth)
-            setReceipts(r => ({ ...r, [id]: rows }))
-          } catch { /* keep old */ }
-        }
-      }, 250)
-    }
-
-    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
-    const connect = () => {
-      if (!alive) return
-      try {
-        ws = new WebSocket(`${scheme}://${location.host}/ws/events?token=${token}`)
-      } catch { scheduleRetry(); return }
-      ws.onopen = () => { retry = 0 }
-      ws.onmessage = (m) => {
-        if (!alive) return
-        try {
-          const e = JSON.parse(m.data)
-          if (e.event === 'ALERT_CREATED' || e.event === 'ALERT_ACKNOWLEDGED') refresh()
-        } catch { /* ignore */ }
-      }
-      ws.onerror = () => { try { ws?.close() } catch {} }
-      ws.onclose = () => { scheduleRetry() }
-    }
-    const scheduleRetry = () => {
-      if (!alive) return
-      if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
-      retry = Math.min(retry + 1, 5)
-      if (retryTimer) clearTimeout(retryTimer)
-      retryTimer = setTimeout(() => { if (alive) connect() }, Math.min(1000 * 2 ** retry, 10000))
-    }
-    connect()
-    pingTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try { ws.send(JSON.stringify({ action: 'PING' })) } catch {}
-      }
-    }, 25000)
-    const poll = setInterval(() => { if (alive && !document.hidden) refresh() }, 10000)
-    return () => {
-      alive = false
-      clearInterval(poll)
-      if (pingTimer) clearInterval(pingTimer)
-      if (retryTimer) clearTimeout(retryTimer)
-      if (reloadTimer) clearTimeout(reloadTimer)
-      try { ws?.close() } catch {}
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token])
+  // Live: new alerts and ACKs (from anyone) update the list and open receipts.
+  const loadRef = useRef(load); loadRef.current = load
+  const openRef = useRef(openReceipts); openRef.current = openReceipts
+  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const { connected } = useNexusEvents((e) => {
+    if (e.event !== 'ALERT_CREATED' && e.event !== 'ALERT_ACKNOWLEDGED') return
+    if (reloadTimer.current) clearTimeout(reloadTimer.current)
+    reloadTimer.current = setTimeout(() => {
+      loadRef.current(true)
+      Object.keys(openRef.current).filter(id => openRef.current[id]).forEach(id => fetchReceipts(id))
+    }, 250)
+  }, token)
+  useEffect(() => { if (connected) loadRef.current(true) }, [connected])   // catch up after reconnect
 
   const create = async () => {
     if (!form.title.trim()) return toast.error('Title required')
+    let target_scope = 'all'
+    if (scopeKind === 'role') {
+      if (!scopeRoles.length) return toast.error('Pick at least one role')
+      target_scope = `role:${scopeRoles.join(',')}`
+    } else if (scopeKind === 'users') {
+      if (!scopeUsers.length) return toast.error('Pick at least one person')
+      target_scope = `users:${scopeUsers.join(',')}`
+    }
     try {
-      await api('/api/alerts', {
-        ...auth, method: 'POST',
-        body: JSON.stringify({ ...form, target_scope: targets.length ? 'selected' : 'all', target_users: targets }),
-      })
-      setForm({ title: '', body: '', priority: 'URGENT' })
-      setTargets([])
-      toast.success(targets.length
-        ? `Alert sent to ${targets.length} user${targets.length === 1 ? '' : 's'}`
-        : 'Alert broadcast to everyone')
-      load()
+      await api('/api/alerts', { ...auth, method: 'POST', body: JSON.stringify({ ...form, target_scope }) })
+      setForm({ title: '', body: '', priority: 'IMPORTANT' })
+      toast.success(target_scope === 'all' ? 'Alert broadcast to everyone' : `Alert sent to ${target_scope}`)
+      setScopeUsers([]); setScopeRoles([]); setScopeKind('all')
     } catch (e: any) { toast.error(e.message) }
   }
 
   const loadRanked = async () => {
     try {
-      setAlerts(await api('/api/alerts/ranked', auth))
       setRanked(true)
+      setAlerts(await api('/api/alerts/ranked', auth))
     } catch (e: any) { toast.error(e.message) }
   }
 
@@ -156,25 +101,45 @@ export default function Alerts() {
     try {
       const res = await api(`/api/alerts/${id}/ack`, { ...auth, method: 'POST', body: JSON.stringify({}) })
       toast.success(`Acknowledged (${res.latency_ms} ms)`)
-      load()
+      setAlerts(list => list.map(a => a.id === id ? { ...a, acked_by_me: true, acked: a.acked + 1 } : a))
     } catch (e: any) { toast.error(e.message) }
   }
 
-  const showReceipts = async (id: string) => {
-    const willOpen = !openReceipts[id]
-    setOpenReceipts(o => ({ ...o, [id]: willOpen }))
-    if (!willOpen) return
+  const fetchReceipts = async (id: string) => {
     try {
       const rows = await api(`/api/alerts/${id}/receipts`, auth)
       setReceipts(r => ({ ...r, [id]: rows }))
     } catch (e: any) { toast.error(e.message) }
+  }
+  const showReceipts = (id: string) => {
+    const willOpen = !openReceipts[id]
+    setOpenReceipts(o => ({ ...o, [id]: willOpen }))
+    if (willOpen) fetchReceipts(id)
+  }
+
+  // Initials avatar for a username
+  function Avatar({ name, acked }: { name: string; acked: boolean }) {
+    const initials = name.slice(0, 2).toUpperCase()
+    return (
+      <span
+        title={`${name}${acked ? ' ✓ acked' : ' — pending'}`}
+        className="inline-flex items-center justify-center w-6 h-6 rounded-full text-[10px] font-bold border-2"
+        style={{
+          background: acked ? 'rgba(16,185,129,0.2)' : 'rgba(136,146,176,0.15)',
+          borderColor: acked ? 'var(--success)' : 'var(--border)',
+          color: acked ? 'var(--success)' : 'var(--muted)',
+        }}
+      >
+        {initials}
+      </span>
+    )
   }
 
   return (
     <div className="mx-auto w-full max-w-5xl px-4 sm:px-6 py-6 grid md:grid-cols-2 gap-4 items-start">
       <Card>
         <h2 className="text-lg font-bold flex items-center gap-2 mb-1"><Bell size={17} className="text-[var(--accent)]" /> Raise an alert</h2>
-        <p className="text-xs text-[var(--muted)] mb-3">Broadcasts to every node. Delivery receipts are created per user; ask them to ACK.</p>
+        <p className="text-xs text-[var(--muted)] mb-3">Send to everyone, some roles or named people. Each recipient gets a delivery receipt to ACK.</p>
         <div className="space-y-2">
           <Input value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} placeholder="Title (e.g. Fire drill, Building B)" aria-label="Alert title" />
           <textarea
@@ -185,7 +150,7 @@ export default function Alerts() {
           />
           {/* Priority selector buttons (reused in form) */}
           <div className="flex flex-wrap gap-1.5">
-            {(['CRITICAL', 'URGENT', 'IMPORTANT', 'NORMAL', 'INFO'] as const).map(p => (
+            {allowed.map(p => (
               <button
                 key={p}
                 onClick={() => setForm({ ...form, priority: p })}
@@ -195,33 +160,36 @@ export default function Alerts() {
               </button>
             ))}
           </div>
-          {/* Target picker: no selection = everyone */}
-          <div>
-            <div className="flex items-center justify-between mb-1">
-              <span className="text-xs font-medium text-[var(--muted)]">Send to</span>
-              <span className="text-[11px] text-[var(--muted)]">
-                {targets.length ? `${targets.length} selected` : 'everyone'}
-              </span>
-            </div>
-            <div className="max-h-32 overflow-auto rounded-lg border border-[var(--border)] p-1.5 space-y-0.5">
-              {users.filter(u => u.username !== user).map(u => (
-                <label key={u.username} className="flex items-center gap-2 text-sm rounded-md px-2 py-1 hover:bg-[var(--card-hover)] cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={targets.includes(u.username)}
-                    onChange={() => setTargets(t => t.includes(u.username) ? t.filter(x => x !== u.username) : [...t, u.username])}
-                  />
-                  {u.username}
-                  <span className="text-[11px] text-[var(--muted)]">{u.role}</span>
+          <div className="flex flex-wrap gap-1.5 text-xs items-center">
+            <span className="text-[var(--muted)]">Send to</span>
+            {(['all', 'role', 'users'] as const).map(k => (
+              <button key={k} onClick={() => setScopeKind(k)}
+                className={`rounded-lg px-2.5 py-1 border ${scopeKind === k ? 'border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--muted)]'}`}>
+                {k === 'all' ? 'Everyone' : k === 'role' ? 'Roles' : 'People'}
+              </button>
+            ))}
+          </div>
+          {scopeKind === 'role' && (
+            <div className="flex flex-wrap gap-1.5 text-xs">
+              {['student', 'faculty', 'staff', 'admin'].map(r => (
+                <label key={r} className="flex items-center gap-1">
+                  <input type="checkbox" checked={scopeRoles.includes(r)}
+                    onChange={() => setScopeRoles(v => v.includes(r) ? v.filter(x => x !== r) : [...v, r])} /> {r}
                 </label>
               ))}
-              {users.length === 0 && <p className="text-xs text-[var(--muted)] px-2 py-1">No other users yet — alert goes to everyone.</p>}
             </div>
-            <p className="text-[11px] text-[var(--muted)] mt-1">Leave empty to alert all users.</p>
-          </div>
-          <Button onClick={create} className="w-full">
-            {targets.length ? `Send ${form.priority} alert to ${targets.length}` : `Broadcast ${form.priority} alert`}
-          </Button>
+          )}
+          {scopeKind === 'users' && (
+            <div className="flex flex-wrap gap-1.5 text-xs max-h-24 overflow-auto">
+              {users.map(u => (
+                <label key={u.username} className="flex items-center gap-1">
+                  <input type="checkbox" checked={scopeUsers.includes(u.username)}
+                    onChange={() => setScopeUsers(v => v.includes(u.username) ? v.filter(x => x !== u.username) : [...v, u.username])} /> {u.username}
+                </label>
+              ))}
+            </div>
+          )}
+          <Button onClick={create} className="w-full">Send {form.priority} alert</Button>
         </div>
       </Card>
 
@@ -242,14 +210,15 @@ export default function Alerts() {
               {p}
             </button>
           ))}
-          <Button variant="secondary" onClick={loadRanked} className="ml-auto text-xs">Smart rank</Button>
-          <Button variant="secondary" onClick={() => load()} className="text-xs">↺</Button>
+          <Button variant="secondary" onClick={() => ranked ? (setRanked(false), load(false, false)) : loadRanked()} className="ml-auto text-xs">
+            {ranked ? 'Newest first' : 'Smart rank'}
+          </Button>
         </div>
-        {ranked && <p className="text-xs text-[var(--muted)] mb-2">Sorted by smart rank (priority × sender affinity × recency).</p>}
+        {ranked && <p className="text-xs text-[var(--muted)] mb-2">Sorted by smart rank (learned from what you acknowledge, plus recency). Alerts below your minimum priority are dimmed at the bottom.</p>}
 
         <div className="space-y-2 max-h-[560px] overflow-auto">
           {alerts.map(a => (
-            <div key={a.id} className="rounded-xl border border-[var(--border)] bg-[var(--card)] p-3">
+            <div key={a.id} className={`rounded-xl border border-[var(--border)] bg-[var(--card)] p-3 ${a.below_threshold ? 'opacity-50' : ''}`}>
               <div className="flex items-start gap-2">
                 {/* Priority dot — CRITICAL pulses */}
                 <span
@@ -268,6 +237,15 @@ export default function Alerts() {
                     by {a.sender} · {new Date(a.created_at).toLocaleString()} · {a.acked}/{a.total} acked
                     {typeof a.score === 'number' && <span> · score {a.score}</span>}
                   </div>
+
+                  {/* ACK avatar strip */}
+                  {openReceipts[a.id] && receipts[a.id] && receipts[a.id].length > 0 && (
+                    <div className="flex gap-1 mt-1.5 flex-wrap">
+                      {receipts[a.id].map(r => (
+                        <Avatar key={r.user} name={r.user} acked={!!r.acked_at} />
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
               <div className="flex gap-2 mt-2 flex-wrap">
@@ -278,8 +256,7 @@ export default function Alerts() {
                     : <Button onClick={() => ack(a.id)}><span className="flex items-center gap-1.5 text-xs"><CheckCheck size={13} /> Acknowledge</span></Button>}
                 <Button variant="secondary" onClick={() => showReceipts(a.id)}>
                   <span className="flex items-center gap-1.5 text-xs">
-                    <ChevronDown size={13} className={`transition-transform ${openReceipts[a.id] ? 'rotate-180' : ''}`} />
-                    Who got it?
+                    <ChevronDown size={13} className={`transition-transform ${openReceipts[a.id] ? 'rotate-180' : ''}`} /> Who got it?
                   </span>
                 </Button>
               </div>

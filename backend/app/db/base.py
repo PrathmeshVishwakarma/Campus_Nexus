@@ -1,15 +1,3 @@
 from app.db.session import Base  # noqa: F401
 
-from app.db.models.models import (  # noqa: F401
-    Alert,
-    AlertReceipt,
-    Channel,
-    Event,
-    FileVersion,
-    Message,
-    Peer,
-    PushSubscription,
-    SharedFolder,
-    SyncTask,
-    User,
-)
+import app.db.models  # noqa: F401  (registers every model on Base.metadata)

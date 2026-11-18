@@ -1,120 +1,195 @@
-"""Notification ranking.
+"""Alert ranking: which alerts is this user most likely to act on?
 
-Two modes
----------
-1. **Learned** (default once enough history exists): a logistic regression is
-   trained on this user's past alert receipts. Label = did the user acknowledge
-   the alert. Features = priority weight, sender affinity, alert age. The
-   predicted acknowledgement probability is the rank score.
-2. **Heuristic fallback**: the original hand-weighted formula, used when the
-   user has too little history (cold start) or only one outcome class.
+Model
+-----
+A per-user logistic regression predicts P(user acknowledges alert) from
 
-Every returned item carries ``"method"`` so the UI/tests can tell which mode ran.
+* ``priority``    — priority weight / 100
+* ``sender_rate`` — Laplace-smoothed share of this sender's *earlier* alerts the
+                    user acknowledged ((acked + 1) / (seen + 2))
+* ``chat``        — how much the sender talks in channels the user belongs to
+                    *before* the alert (min(n, 20) / 20)
+
+Leakage / skew fixes
+--------------------
+* Features for a training row only use history from before that alert was
+  created, so the label (did they ack?) never leaks into ``sender_rate``.
+* Alert age is *not* a model feature (training rows can't see "age at ranking
+  time"); recency is applied after the model, identically in both modes.
+* An un-acked alert only counts as "ignored" once it is older than
+  ``LABEL_HORIZON_H`` — unseen is not the same as ignored. The user's own
+  alerts are excluded.
+
+Output
+------
+``score = 100 * (0.8 * relevance + 0.2 * recency)`` in both modes, where
+relevance is the learned probability or the heuristic
+``0.65 * priority + 0.35 * sender_affinity``. Already-acknowledged alerts sink
+to the bottom. Models are cached per user until their receipt history changes.
 """
 
+import bisect
 import logging
-from datetime import datetime
+from collections import OrderedDict
+from datetime import datetime, timedelta
 
 import numpy as np
+from sqlalchemy import func
+
+from app.core.timeutil import utcnow
+from app.schemas import PRIORITY_MAP
 
 log = logging.getLogger("campus_nexus.ml.ranker")
 
-PRIORITY_W = {"CRITICAL": 100, "URGENT": 80, "IMPORTANT": 60, "NORMAL": 40, "INFO": 10}
-MIN_TRAIN_ROWS = 8          # receipts needed before we trust a learned model
+MIN_TRAIN_ROWS = 20          # labelled receipts needed before we trust a learned model
+LABEL_HORIZON_H = 24         # un-acked alerts younger than this are "not seen yet"
+RECENCY_HALF_LIFE_H = 24
+_CACHE_MAX = 256
+_model_cache: "OrderedDict[tuple, object]" = OrderedDict()
 
 
-# --------------------------------------------------------------------------- heuristic
+def _prio(p: str | None) -> float:
+    return PRIORITY_MAP.get((p or "NORMAL").upper(), 40) / 100.0
+
+
+def recency(age_h: float) -> float:
+    return 1.0 / (1.0 + max(0.0, age_h) / RECENCY_HALF_LIFE_H)
+
+
+def blend(relevance: float, age_h: float) -> float:
+    return 100.0 * (0.8 * relevance + 0.2 * recency(age_h))
+
+
+def heuristic_relevance(priority: str, sender_rate: float, chat: float) -> float:
+    affinity = 0.7 * sender_rate + 0.3 * chat
+    return 0.65 * _prio(priority) + 0.35 * affinity
+
+
+# kept for callers/tests of the old API
 def rank_score(priority: str, sender_affinity: float = 0.5, recency_h: float = 1.0) -> float:
-    """Original hand-weighted formula (kept as the cold-start fallback)."""
-    base = PRIORITY_W.get(priority.upper(), 40)
-    return base * 0.6 + sender_affinity * 30 + max(0, 10 - recency_h)
+    return blend(0.65 * _prio(priority) + 0.35 * sender_affinity, recency_h)
 
 
-def _features(priority: str, affinity: float, age_h: float) -> list[float]:
-    return [PRIORITY_W.get(priority.upper(), 40) / 100.0,
-            affinity,
-            1.0 / (1.0 + max(0.0, age_h))]     # newer alert -> closer to 1
+# --------------------------------------------------------------------------- history
+class _History:
+    """Everything needed to compute point-in-time features for one user, loaded once."""
+
+    def __init__(self, db, username: str):
+        from app.db.models.models import Alert, AlertReceipt, Channel, Message
+        self.username = username
+        rows = (db.query(AlertReceipt, Alert).join(Alert, Alert.id == AlertReceipt.alert_id)
+                .filter(AlertReceipt.user == username, Alert.sender != username)
+                .order_by(Alert.created_at).all())
+        self.rows = rows
+        # per sender: sorted (created_at, acked_at|None) for point-in-time lookups
+        self.by_sender: dict[str, list[tuple[datetime, datetime | None]]] = {}
+        for r, a in rows:
+            self.by_sender.setdefault(a.sender, []).append((a.created_at, r.acked_at))
+        my_channels = [c.id for c in db.query(Channel).all() if username in (c.members or [])]
+        self.chat_times: dict[str, list[datetime]] = {}
+        if my_channels:
+            for sender, ts in (db.query(Message.sender, Message.created_at)
+                               .filter(Message.channel_id.in_(my_channels), Message.sender != username)
+                               .order_by(Message.created_at).all()):
+                self.chat_times.setdefault(sender, []).append(ts)
+
+    def sender_rate(self, sender: str, before: datetime) -> float:
+        """Smoothed ack rate for this sender as it was known at time ``before``:
+        an earlier alert counts as acked only if acked before then, and as
+        ignored only if it was already older than the label horizon."""
+        horizon = before - timedelta(hours=LABEL_HORIZON_H)
+        seen = acked = 0
+        for created, acked_at in self.by_sender.get(sender, []):
+            if created >= before:
+                break
+            if acked_at is not None and acked_at < before:
+                seen += 1
+                acked += 1
+            elif created <= horizon:
+                seen += 1
+        return (acked + 1) / (seen + 2)
+
+    def chat(self, sender: str, before: datetime) -> float:
+        n = bisect.bisect_left(self.chat_times.get(sender, []), before)
+        return min(n, 20) / 20.0
+
+    def feats(self, priority: str, sender: str, at: datetime) -> list[float]:
+        return [_prio(priority), self.sender_rate(sender, at), self.chat(sender, at)]
 
 
-# --------------------------------------------------------------------------- affinity
-def affinity_for(db, username: str, sender: str, _cache: dict | None = None) -> float:
-    """Affinity 0..1 from past interaction: acked sender's alerts + got their messages."""
-    key = (username, sender)
-    if _cache is not None and key in _cache:
-        return _cache[key]
-    from app.db.models.models import Alert, AlertReceipt, Message
-    try:
-        acked = db.query(AlertReceipt).filter(
-            AlertReceipt.user == username, AlertReceipt.acked_at.is_not(None)).join(
-            Alert, Alert.id == AlertReceipt.alert_id).filter(Alert.sender == sender).count()
-        msgs = db.query(Message).filter(Message.sender == sender).count()
-        val = min(1.0, 0.4 + acked * 0.15 + min(msgs, 10) * 0.03)
-    except Exception:
-        log.exception("affinity_for failed; using neutral 0.5")
-        val = 0.5
-    if _cache is not None:
-        _cache[key] = val
-    return val
-
-
-# --------------------------------------------------------------------------- training
-def _training_data(db, username: str):
-    """Build (X, y) from this user's alert receipts. Returns (None, None) if unusable."""
-    from app.db.models.models import Alert, AlertReceipt
-    rows = (db.query(AlertReceipt, Alert)
-            .join(Alert, Alert.id == AlertReceipt.alert_id)
-            .filter(AlertReceipt.user == username).all())
-    if len(rows) < MIN_TRAIN_ROWS:
-        return None, None
+def _training_data(hist: _History, now: datetime):
+    horizon = now - timedelta(hours=LABEL_HORIZON_H)
     X, y = [], []
-    cache: dict = {}
-    for receipt, alert in rows:
-        # age measured at the time the user acted (ack) or delivery, so the
-        # feature reflects what the user actually saw, not "now".
-        ref = receipt.acked_at or receipt.delivered_at
-        age_h = max(0.0, (ref - alert.created_at).total_seconds() / 3600)
-        X.append(_features(alert.priority, affinity_for(db, username, alert.sender, cache), age_h))
-        y.append(1 if receipt.acked_at else 0)
-    y_arr = np.array(y)
-    if len(set(y_arr.tolist())) < 2:          # need both acked and un-acked examples
+    for receipt, alert in hist.rows:
+        acked = receipt.acked_at is not None
+        if not acked and alert.created_at > horizon:
+            continue                       # not seen yet -> no label
+        X.append(hist.feats(alert.priority, alert.sender, alert.created_at))
+        y.append(1 if acked else 0)
+    if len(y) < MIN_TRAIN_ROWS or len(set(y)) < 2:
         return None, None
-    return np.array(X, dtype=float), y_arr
+    return np.array(X, dtype=float), np.array(y)
 
 
-def _fit(db, username: str):
-    X, y = _training_data(db, username)
-    if X is None:
-        return None
-    try:
-        from sklearn.linear_model import LogisticRegression
-        model = LogisticRegression(class_weight="balanced", max_iter=200)
-        model.fit(X, y)
-        return model
-    except Exception:
-        log.exception("ranker training failed; falling back to heuristic")
-        return None
+def _cache_key(db, username: str) -> tuple:
+    from app.db.models.models import AlertReceipt
+    n, last_ack, last_deliv = db.query(func.count(AlertReceipt.id), func.max(AlertReceipt.acked_at),
+                                       func.max(AlertReceipt.delivered_at)).filter(
+        AlertReceipt.user == username).one()
+    hour = utcnow().replace(minute=0, second=0, microsecond=0)   # labels age past the horizon
+    return (username, n, last_ack, last_deliv, hour)
+
+
+def _fit(db, username: str, hist: _History, now: datetime):
+    key = _cache_key(db, username)
+    if key in _model_cache:
+        _model_cache.move_to_end(key)
+        return _model_cache[key]
+    X, y = _training_data(hist, now)
+    model = None
+    if X is not None:
+        try:
+            from sklearn.linear_model import LogisticRegression
+            model = LogisticRegression(class_weight="balanced", C=1.0, max_iter=500)
+            model.fit(X, y)
+        except Exception:
+            log.exception("ranker training failed; falling back to heuristic")
+            model = None
+    _model_cache[key] = model
+    while len(_model_cache) > _CACHE_MAX:
+        _model_cache.popitem(last=False)
+    return model
+
+
+def clear_cache():
+    _model_cache.clear()
 
 
 # --------------------------------------------------------------------------- public API
 def rank_alerts(db, username: str, alerts: list) -> list:
-    now = datetime.utcnow()
-    model = _fit(db, username)
+    from app.db.models.models import AlertReceipt
+    now = utcnow()
+    hist = _History(db, username)
+    model = _fit(db, username, hist, now)
     method = "learned" if model is not None else "heuristic"
-    cache: dict = {}
-    feats, rows = [], []
-    for a in alerts:
-        age_h = max(0.0, (now - a.created_at).total_seconds() / 3600)
-        aff = affinity_for(db, username, a.sender, cache)
-        rows.append((a, aff, age_h))
-        feats.append(_features(a.priority, aff, age_h))
+    acked_ids = set()
+    if alerts:
+        acked_ids = {aid for (aid,) in db.query(AlertReceipt.alert_id).filter(
+            AlertReceipt.user == username, AlertReceipt.acked_at.is_not(None),
+            AlertReceipt.alert_id.in_([a.id for a in alerts])).all()}
 
+    feats = [hist.feats(a.priority, a.sender, now) for a in alerts]
     if model is not None and feats:
-        # Scale probability to 0..100 so the scale matches the heuristic mode.
-        scores = (model.predict_proba(np.array(feats, dtype=float))[:, 1] * 100).tolist()
+        relevance = model.predict_proba(np.array(feats, dtype=float))[:, 1].tolist()
     else:
-        scores = [rank_score(a.priority, aff, age_h) for a, aff, age_h in rows]
+        relevance = [heuristic_relevance(a.priority, f[1], f[2]) for a, f in zip(alerts, feats)]
 
-    scored = sorted(zip(scores, (r[0] for r in rows)), key=lambda x: -x[0])
+    scored = []
+    for a, rel in zip(alerts, relevance):
+        age_h = max(0.0, (now - a.created_at).total_seconds() / 3600)
+        scored.append((a.id in acked_ids, -blend(float(rel), age_h), a, blend(float(rel), age_h)))
+    scored.sort(key=lambda t: (t[0], t[1]))
     return [{"id": a.id, "title": a.title, "body": a.body, "priority": a.priority,
              "sender": a.sender, "created_at": a.created_at.isoformat(),
-             "score": round(float(s), 1), "method": method} for s, a in scored]
+             "score": round(s, 1), "method": method, "acked_by_me": acked}
+            for acked, _, a, s in scored]

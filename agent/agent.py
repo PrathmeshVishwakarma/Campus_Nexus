@@ -1,27 +1,40 @@
 """Standalone Campus Nexus node agent — stdlib only (no FastAPI/watchdog deps).
 
-Watches a folder by polling, heartbeats to the server, and uploads
-changed files in 1MB chunks with SHA-256 resume/dedup via /sync/manifest.
+Watches a folder by polling, heartbeats to the server, and uploads changed
+files in 1 MB chunks with SHA-256 dedup via /sync/manifest.
+
+Conflict detection: the agent remembers which server version each local file
+was last synced from and sends it as ``base_version``. If someone else committed
+a newer version in between, the server records a VERSION_CONFLICT (both
+versions are kept and can be restored from the Files page).
 
 Usage:
-  python agent.py --folder ../shared/demo_files --server http://localhost:8000 \\
-      --username node1 --password pass123
+  python agent.py --folder ../shared/my_copy --server http://localhost:8000 --username node1
+  (password from --password, $NEXUS_PASSWORD, or an interactive prompt)
 """
 
 import argparse
+import getpass
 import hashlib
 import http.client
 import json
-import mimetypes
+import os
 import socket
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 CHUNK = 1024 * 1024
 HELLO_PORT = 9999
+STATE_FILE = ".nexus_agent_state.json"
+
+
+class AuthError(RuntimeError):
+    pass
 
 
 def api(server, method, path, token=None, body=None, query=""):
@@ -32,11 +45,13 @@ def api(server, method, path, token=None, body=None, query=""):
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode() or "{}")
-    except Exception as e:
-        print(f"[agent] api {method} {path} failed: {e}")
-        return {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:300]
+        if e.code == 401:
+            raise AuthError(detail)
+        raise RuntimeError(f"{method} {path} -> {e.code}: {detail}")
 
 
 def login(server, username, password):
@@ -48,19 +63,26 @@ def login(server, username, password):
 
 
 def post_multipart(server, path, query, token, field_name, filename, chunk_bytes):
-    boundary = "AGENTBOUNDARY1234"
+    boundary = uuid.uuid4().hex
+    safe_name = filename.replace('"', "_").replace("\r", "_").replace("\n", "_")
     body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; "
-            f"filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode() + chunk_bytes + f"\r\n--{boundary}--\r\n".encode()
+            f"filename=\"{safe_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode() \
+        + chunk_bytes + f"\r\n--{boundary}--\r\n".encode()
     u = urllib.parse.urlparse(server.rstrip("/") + path + query)
-    conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=30)
+    conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(u.hostname, u.port or (443 if u.scheme == "https" else 80), timeout=60)
     headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
                "Content-Length": str(len(body))}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    conn.request("POST", u.path + ("?" + u.query if u.query else ""), body, headers)
-    resp = conn.getresponse()
-    data = resp.read().decode()
-    conn.close()
+    try:
+        conn.request("POST", u.path + ("?" + u.query if u.query else ""), body, headers)
+        resp = conn.getresponse()
+        data = resp.read().decode()
+    finally:
+        conn.close()
+    if resp.status == 401:
+        raise AuthError(data[:200])
     if resp.status >= 400:
         raise RuntimeError(f"chunk upload {resp.status}: {data[:200]}")
     return json.loads(data or "{}")
@@ -70,33 +92,54 @@ def sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def upload_file(server, token, folder: Path, rel: str):
-    p = folder / rel
-    data = p.read_bytes()
+def q(rel: str) -> str:
+    return urllib.parse.quote(rel, safe="")
+
+
+def upload_file(server, token, folder: Path, rel: str, base_version: int | None):
+    """Upload one file; returns the server's response to /sync/complete."""
+    data = (folder / rel).read_bytes()
     total = max(1, -(-len(data) // CHUNK))
-    man = api(server, "GET", "/api/sync/manifest", token, query=f"?path={urllib.parse.quote(rel)}")
+    man = api(server, "GET", "/api/sync/manifest", token, query=f"?path={q(rel)}")
     existing = [c["hash"] for c in (man.get("chunks") or [])] if man.get("exists") else []
+    if base_version is None:
+        # first time we see this file: our copy is based on whatever the server has
+        base_version = man.get("version") or None
+    upload_id = uuid.uuid4().hex
     for i in range(total):
         piece = data[i * CHUNK:(i + 1) * CHUNK]
         if i < len(existing) and existing[i] == sha(piece):
-            print(f"  chunk {i}/{total} skipped (dedup)")
             continue
         post_multipart(server, "/api/sync/chunk",
-                       f"?path={urllib.parse.quote(rel)}&index={i}&total={total}",
+                       f"?path={q(rel)}&index={i}&total={total}&upload_id={upload_id}",
                        token, "file", Path(rel).name, piece)
-        print(f"  chunk {i + 1}/{total} uploaded")
-    done = api(server, "POST", "/api/sync/complete", token, {},
-               query=f"?path={urllib.parse.quote(rel)}")
-    print(f"[agent] synced {rel} -> v{done.get('version')} conflict={done.get('conflict')} deduped={done.get('deduped')}")
+    body = {"size": len(data)}
+    if base_version:
+        body["base_version"] = base_version
+    done = api(server, "POST", "/api/sync/complete", token, body,
+               query=f"?path={q(rel)}&upload_id={upload_id}")
+    print(f"[agent] synced {rel} -> v{done.get('version')} conflict={done.get('conflict')} "
+          f"deduped={done.get('deduped')}")
+    return done
+
+
+def local_ip(server: str) -> str:
+    """The address this machine uses to reach the server (no packets sent)."""
+    host = urllib.parse.urlparse(server).hostname or "8.8.8.8"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((host, 80))
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
 
 
 def broadcast_hello():
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.sendto(json.dumps({"msg": "CAMPUS_NEXUS_HELLO",
-                             "host": socket.gethostname()}).encode(), ("<broadcast>", HELLO_PORT))
-        s.close()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(json.dumps({"msg": "CAMPUS_NEXUS_HELLO", "host": socket.gethostname()}).encode(),
+                     ("<broadcast>", HELLO_PORT))
     except OSError as e:
         print("[agent] broadcast failed:", e)
 
@@ -107,7 +150,7 @@ def listen_hello():
     try:
         s.bind(("", HELLO_PORT))
     except OSError:
-        return
+        return  # the server on this machine already listens; fine
     s.settimeout(3.0)
     while True:
         try:
@@ -118,56 +161,83 @@ def listen_hello():
             continue
 
 
+def load_state(folder: Path) -> dict:
+    try:
+        return json.loads((folder / STATE_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(folder: Path, state: dict):
+    tmp = folder / (STATE_FILE + ".tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, folder / STATE_FILE)
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--folder", default="../shared/demo_files")
+    ap = argparse.ArgumentParser(description="Campus Nexus folder sync agent")
+    ap.add_argument("--folder", required=True, help="local folder to sync")
     ap.add_argument("--server", default="http://localhost:8000")
-    ap.add_argument("--username", default="node1")
-    ap.add_argument("--password", default="pass123")
+    ap.add_argument("--username", required=True)
+    ap.add_argument("--password", default=os.environ.get("NEXUS_PASSWORD"),
+                    help="defaults to $NEXUS_PASSWORD, else prompts")
+    ap.add_argument("--interval", type=float, default=2.0)
     args = ap.parse_args()
+    password = args.password or getpass.getpass(f"Password for {args.username}: ")
 
     folder = Path(args.folder)
     folder.mkdir(parents=True, exist_ok=True)
     print(f"[agent] watching {folder.resolve()} -> {args.server}")
-
     threading.Thread(target=listen_hello, daemon=True).start()
 
-    try:
-        token = login(args.server, args.username, args.password)
-        print("[agent] logged in as", args.username)
-    except Exception as e:
-        print(f"[agent] login failed ({e}); will retry on upload")
-        token = None
-
+    token = None
+    state = load_state(folder)            # rel -> {"version": n, "sha": ...}
     seen: dict[str, tuple[float, int]] = {}
     last_hb = 0.0
+    ip = local_ip(args.server)
     while True:
-        # heartbeat every 15s
-        if time.time() - last_hb > 15:
-            broadcast_hello()
-            if token:
+        try:
+            if token is None:
+                token = login(args.server, args.username, password)
+                print("[agent] logged in as", args.username)
+            if time.time() - last_hb > 15:
+                broadcast_hello()
+                t0 = time.time()
                 api(args.server, "POST", "/api/peers/heartbeat", token,
-                    {"hostname": socket.gethostname(), "ip": "127.0.0.1", "latency_ms": 1.0})
-            last_hb = time.time()
-        # poll folder
-        for p in folder.rglob("*"):
-            if not p.is_file():
-                continue
-            rel = str(p.relative_to(folder))
-            key = (p.stat().st_mtime, p.stat().st_size)
-            if seen.get(rel) != key:
-                seen[rel] = key
-                print(f"[agent] change: {rel}")
-                if token and p.stat().st_size > 0:
-                    try:
-                        upload_file(args.server, token, folder, rel)
-                    except Exception as e:
-                        print("[agent] upload failed:", e)
-                        try:
-                            token = login(args.server, args.username, args.password)
-                        except Exception:
-                            pass
-        time.sleep(2)
+                    {"hostname": socket.gethostname(), "ip": ip, "latency_ms": 0.0})
+                last_hb = time.time()
+                print(f"[agent] heartbeat ok ({(last_hb - t0) * 1000:.0f} ms)")
+            for p in folder.rglob("*"):
+                if not p.is_file() or p.name.startswith(STATE_FILE):
+                    continue
+                rel = p.relative_to(folder).as_posix()     # always '/' for the server
+                st = p.stat()
+                key = (st.st_mtime, st.st_size)
+                if seen.get(rel) == key:
+                    continue
+                if st.st_size == 0:
+                    seen[rel] = key
+                    continue
+                digest = sha(p.read_bytes())
+                if state.get(rel, {}).get("sha") == digest:
+                    seen[rel] = key
+                    continue
+                done = upload_file(args.server, token, folder, rel, state.get(rel, {}).get("version"))
+                state[rel] = {"version": done.get("version"), "sha": digest}
+                save_state(folder, state)
+                seen[rel] = key                     # only after a successful upload
+        except AuthError:
+            print("[agent] session expired; logging in again")
+            token = None
+        except urllib.error.URLError as e:
+            print(f"[agent] server unreachable ({e.reason}); retrying")
+        except Exception as e:
+            msg = str(e)
+            if "423" in msg:
+                print("[agent] sync paused by the server (anomaly review); waiting")
+            else:
+                print("[agent] error:", msg)
+        time.sleep(args.interval)
 
 
 if __name__ == "__main__":

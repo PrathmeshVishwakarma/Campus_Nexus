@@ -8,7 +8,8 @@ from sqlalchemy import pool
 from alembic import context
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from app.db.base import Base
+import app.db.base  # noqa: F401  (registers models)
+from app.db.session import Base
 from app.core.config import settings
 
 # this is the Alembic Config object, which provides
@@ -17,7 +18,7 @@ config = context.config
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
-if config.config_file_name is not None:
+if config.config_file_name is not None and config.attributes.get("configure_logger", True):
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata

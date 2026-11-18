@@ -1,13 +1,15 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { useSearchParams } from 'react-router-dom'
 import { useDropzone } from 'react-dropzone'
 import {
   ChevronDown, ChevronRight, Download, FileText, Folder, FolderOpen, FolderSearch, FolderUp,
-  Lock, MessageSquare, RefreshCw, Trash2, Upload, History, ShieldCheck,
+  Lock, MessageSquare, Trash2, Upload, History, ShieldCheck,
   Settings2, Users, Activity, Plus,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { api, useAuth } from '../store/useAuth'
+import { api, authFetch, useAuth } from '../store/useAuth'
+import { useNexusEvents } from '../hooks/useNexusEvents'
+import { FileDiscussionPanel } from '../components/FileDiscussionPanel'
 import { Card } from '../components/ui/card'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
@@ -15,15 +17,23 @@ import { Input } from '../components/ui/input'
 type TreeFile = { name: string; path: string; type: 'file'; size: number; version: number; hash: string; modified_by: string }
 type TreeDir = { name: string; path: string; type: 'dir'; children: TreeNode[]; locked?: boolean; members?: string[] }
 type TreeNode = TreeFile | TreeDir
-type Version = { version: number; hash: string; size: number; by: string; at: string; chunks: unknown; clock: Record<string, number> }
+type Version = { version: number; hash: string; size: number; by: string; at: string; chunks: unknown; clock: Record<string, number>; restorable?: boolean }
 type AuditItem = { id: string; type: string; actor: string; resource: string; priority: number; payload: any; timestamp: string }
-type FolderInfo = { name: string; path: string; members: string[]; locked: boolean; files: number }
+type FolderInfo = { name: string; path: string; members: string[]; locked: boolean; files: number; viewers?: string[]; can_edit?: boolean }
 type UserItem = { username: string; email: string; role: string }
 type DiffItem = { path: string; status: 'new' | 'unchanged' | 'changed' | 'invalid' | 'forbidden'; server_size: number }
 
 const CHUNK = 1024 * 1024
 
+// crypto.subtle / randomUUID only exist in secure contexts (https or localhost).
+// On plain-http LAN access we skip hashing (no dedup) instead of failing.
+function newUploadId() {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID().replace(/-/g, '')
+  return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
+}
+
 async function sha256Blob(blob: Blob): Promise<string> {
+  if (typeof crypto === 'undefined' || !crypto.subtle) return ''
   const buf = await blob.arrayBuffer()
   const digest = await crypto.subtle.digest('SHA-256', buf)
   return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('')
@@ -37,16 +47,15 @@ export default function Files() {
   const [folders, setFolders] = useState<FolderInfo[]>([])
   const [rootPath, setRootPath] = useState('')
   const [isAdmin, setIsAdmin] = useState(false)
-  // Finder/Explorer opens on the machine running the server, so only show it
-  // when this browser is actually on that machine (localhost or its hostname).
-  const [canUseFinder, setCanUseFinder] = useState(false)
   const [users, setUsers] = useState<UserItem[]>([])
   const [query, setQuery] = useState('')
-  const [selected, setSelected] = useState<string | null>(null)
+  const [params, setParams] = useSearchParams()
+  const [selected, setSelected] = useState<string | null>(params.get('file'))
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ '': true })
   const [versions, setVersions] = useState<Version[]>([])
   const [activity, setActivity] = useState<AuditItem[]>([])
-  const [tab, setTab] = useState<'versions' | 'activity'>('versions')
+  const [tab, setTab] = useState<'versions' | 'activity' | 'discussion'>(
+    params.get('tab') === 'discussion' ? 'discussion' : params.get('tab') === 'activity' ? 'activity' : 'versions')
   // modals
   const [showUpload, setShowUpload] = useState(false)
   const [showRoot, setShowRoot] = useState(false)
@@ -55,6 +64,7 @@ export default function Files() {
   const [newRoot, setNewRoot] = useState('')
   const [newFolderName, setNewFolderName] = useState('')
   const [accessPick, setAccessPick] = useState<string[]>([])
+  const [accessViewOnly, setAccessViewOnly] = useState<string[]>([])
   const [uploadDir, setUploadDir] = useState('')
   const [uploadMode, setUploadMode] = useState<'choose' | 'new'>('choose')
   const [uploadNew, setUploadNew] = useState('')
@@ -102,95 +112,51 @@ export default function Files() {
   }
 
   useEffect(() => { load(); loadMe() }, [])
-  useEffect(() => {
-    const host = location.hostname.toLowerCase()
-    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]') {
-      setCanUseFinder(true)
-      return
-    }
-    fetch('/health')
-      .then(r => r.json())
-      .then(h => {
-        const node = String(h?.node || '').toLowerCase()
-        if (node && (host === node || host.split('.')[0] === node.split('.')[0])) setCanUseFinder(true)
-      })
-      .catch(() => {})
-  }, [])
   useEffect(() => { if (selected) loadDetail(selected) }, [selected])
-
-  // Live refresh: any file/folder/sync event from the backend reloads the
-  // tree and the open detail panel (plus a quiet poll as a socket fallback,
-  // so phones on flaky networks still stay in sync without a manual refresh).
-  const loadRef = useRef(load)
-  loadRef.current = load
-  const loadDetailRef = useRef(loadDetail)
-  loadDetailRef.current = loadDetail
-  const selectedRef = useRef(selected)
-  selectedRef.current = selected
-
+  // keep the URL in sync so a file view can be linked / survives reload
   useEffect(() => {
-    let alive = true
-    let ws: WebSocket | null = null
-    let retry = 0
-    let retryTimer: ReturnType<typeof setTimeout> | null = null
-    let pingTimer: ReturnType<typeof setInterval> | null = null
-    let reloadTimer: ReturnType<typeof setTimeout> | null = null
-
-    const relevant = (t: string) =>
-      t.startsWith('FILE') || t.startsWith('SYNC') || t.startsWith('FOLDER') ||
-      t.startsWith('ROOT') || t === 'VERSION_CONFLICT'
-
-    const reload = () => {
-      if (reloadTimer) clearTimeout(reloadTimer)
-      reloadTimer = setTimeout(() => {
-        loadRef.current(true)
-        const sel = selectedRef.current
-        if (sel) loadDetailRef.current(sel, true)
-      }, 250)
-    }
-
-    const onEvent = (raw: string) => {
-      try {
-        const e = JSON.parse(raw)
-        if (e.event && relevant(e.event)) reload()
-      } catch { /* ignore malformed frames */ }
-    }
-
-    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
-    const connect = () => {
-      if (!alive) return
-      try {
-        ws = new WebSocket(`${scheme}://${location.host}/ws/events?token=${token}`)
-      } catch { scheduleRetry(); return }
-      ws.onopen = () => { retry = 0 }
-      ws.onmessage = (m) => { if (alive) onEvent(m.data) }
-      ws.onerror = () => { try { ws?.close() } catch {} }
-      ws.onclose = () => { scheduleRetry() }
-    }
-    const scheduleRetry = () => {
-      if (!alive) return
-      if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
-      retry = Math.min(retry + 1, 5)
-      if (retryTimer) clearTimeout(retryTimer)
-      retryTimer = setTimeout(() => { if (alive) connect() }, Math.min(1000 * 2 ** retry, 10000))
-    }
-    connect()
-    pingTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try { ws.send(JSON.stringify({ action: 'PING' })) } catch {}
-      }
-    }, 25000)
-    const poll = setInterval(() => { if (alive && !document.hidden) reload() }, 5000)
-    return () => {
-      alive = false
-      clearInterval(poll)
-      if (pingTimer) clearInterval(pingTimer)
-      if (retryTimer) clearTimeout(retryTimer)
-      if (reloadTimer) clearTimeout(reloadTimer)
-      try { ws?.close() } catch {}
-    }
+    const next = new URLSearchParams()
+    if (selected) next.set('file', selected)
+    if (selected && tab !== 'versions') next.set('tab', tab)
+    if (next.toString() !== params.toString()) setParams(next, { replace: true })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token])
+  }, [selected, tab])
+  useEffect(() => {
+    if (!selected) return
+    const parts = selected.split('/')                     // reveal a deep-linked file in the tree
+    setExpanded(e => { const n = { ...e }; for (let i = 1; i < parts.length; i++) n[parts.slice(0, i).join('/')] = true; return n })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Live: any file/folder/sync event reloads the tree and the open file's panel.
+  const loadRef = useRef(load); loadRef.current = load
+  const detailRef = useRef(loadDetail); detailRef.current = loadDetail
+  const selRef = useRef(selected); selRef.current = selected
+  const liveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const { connected } = useNexusEvents((e) => {
+    const t = e.event || ''
+    if (!(t.startsWith('FILE') || t.startsWith('FOLDER') || t.startsWith('ROOT') || t.startsWith('SYNC') || t === 'VERSION_CONFLICT')) return
+    if (liveTimer.current) clearTimeout(liveTimer.current)
+    liveTimer.current = setTimeout(() => {
+      loadRef.current(true)
+      if (selRef.current) detailRef.current(selRef.current, true)
+    }, 250)
+  }, token)
+  useEffect(() => {
+    if (connected) { loadRef.current(true); return }            // catch up after reconnect
+    const poll = setInterval(() => { if (!document.hidden) loadRef.current(true) }, 10000)
+    return () => clearInterval(poll)
+  }, [connected])
+
+  // write access for the folder of the selected file (view-only members can't change it)
+  const canEditPath = (path: string | null) => {
+    if (!path || isAdmin) return true
+    const top = path.includes('/') ? path.split('/')[0] : ''
+    const f = folders.find(x => x.path === top)
+    return !f || f.can_edit !== false
+  }
+  // Finder/Explorer opens on the server machine: only useful when this browser runs there
+  const onServerMachine = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(location.hostname)
 
   const matches = (n: TreeNode, q: string): boolean => {
     if (!q) return true
@@ -218,11 +184,16 @@ export default function Files() {
   // ---- actions ----
   const uploadOne = async (file: File, rel: string, onChunk?: (pct: number) => void) => {
     const total = Math.max(1, Math.ceil(file.size / CHUNK))
+    const uploadId = newUploadId()
     let existing: string[] = []
+    // A browser upload is an explicit overwrite of what the user just saw on the
+    // server, so its base is the server's current version (agents send their own).
+    let baseVersion: number | undefined
     try {
       const m = await api(`/api/sync/manifest?path=${encodeURIComponent(rel)}`, auth)
       if (m.exists && Array.isArray(m.chunks)) existing = m.chunks.map((c: any) => c.hash as string)
-    } catch { /* full upload */ }
+      if (typeof m.version === 'number' && m.version > 0) baseVersion = m.version
+    } catch (e: any) { if (e?.status === 403) throw e /* else: full upload */ }
     let skipped = 0
     for (let i = 0; i < total; i++) {
       const piece = file.slice(i * CHUNK, (i + 1) * CHUNK)
@@ -232,13 +203,15 @@ export default function Files() {
       }
       const form = new FormData()
       form.append('file', piece, file.name)
-      const res = await fetch(`/api/sync/chunk?path=${encodeURIComponent(rel)}&index=${i}&total=${total}`, {
-        method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form,
+      await authFetch(`/api/sync/chunk?path=${encodeURIComponent(rel)}&index=${i}&total=${total}&upload_id=${uploadId}`, {
+        method: 'POST', body: form,
       })
-      if (!res.ok) throw new Error(await res.text())
       onChunk?.(Math.round(((i + 1) / total) * 100))
     }
-    const done = await api(`/api/sync/complete?path=${encodeURIComponent(rel)}`, { ...auth, method: 'POST', body: JSON.stringify({}) })
+    const done = await api(`/api/sync/complete?path=${encodeURIComponent(rel)}&upload_id=${uploadId}`, {
+      ...auth, method: 'POST', body: JSON.stringify({ size: file.size, base_version: baseVersion }),
+    })
+    if (done?.conflict) toast.warning(`${rel}: saved as v${done.version}, but someone else changed it meanwhile — review Versions`)
     return { rel, version: done?.version, deduped: done?.deduped, skipped, total }
   }
 
@@ -275,22 +248,22 @@ export default function Files() {
     } catch (e: any) { toast.error(e.message, { duration: 6000 }) }
   }
 
-  const downloadFile = async (path: string) => {    try {
-      const res = await fetch(`/api/files/download?path=${encodeURIComponent(path)}`, { headers: { Authorization: `Bearer ${token}` } })
-      if (!res.ok) throw new Error(await res.text())
+  const downloadFile = async (path: string, version?: number) => {    try {
+      const res = await authFetch(`/api/files/download?path=${encodeURIComponent(path)}${version ? `&version=${version}` : ''}`)
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
-      a.href = url; a.download = path.split('/').pop() || 'file'; a.click()
+      a.href = url; a.download = (version ? `v${version}_` : '') + (path.split('/').pop() || 'file'); a.click()
       URL.revokeObjectURL(url)
     } catch (e: any) { toast.error(e.message) }
   }
 
-  const resolve = async (path: string, strategy: string) => {
+  const resolve = async (path: string, strategy: string, version?: number) => {
     try {
-      const res = await api(`/api/files/resolve?path=${encodeURIComponent(path)}&strategy=${strategy}`, { ...auth, method: 'POST', body: JSON.stringify({}) })
-      toast.success(`Conflict resolved → v${res.winner_version} by ${res.by}`)
-      loadDetail(path)
+      const q = version ? `&version=${version}` : ''
+      const res = await api(`/api/files/resolve?path=${encodeURIComponent(path)}&strategy=${strategy}${q}`, { ...auth, method: 'POST' })
+      toast.success(res.restored ? `Restored v${res.winner_version} (by ${res.by}) as v${res.version}` : `Kept v${res.winner_version} by ${res.by}`)
+      loadDetail(path); load()
     } catch (e: any) { toast.error(e.message) }
   }
 
@@ -306,13 +279,14 @@ export default function Files() {
   const openAccess = (sub: string) => {
     const f = folders.find(x => x.path === sub)
     setAccessPick(f?.members || [])
+    setAccessViewOnly(f?.viewers || [])
     setShowAccess(sub)
   }
 
   const saveAccess = async () => {
     if (!showAccess) return
     try {
-      await api(`/api/files/folders?subfolder=${encodeURIComponent(showAccess)}`, { ...auth, method: 'POST', body: JSON.stringify({ members: accessPick }) })
+      await api(`/api/files/folders?subfolder=${encodeURIComponent(showAccess)}`, { ...auth, method: 'POST', body: JSON.stringify({ members: accessPick, viewers: accessViewOnly.filter(v => accessPick.includes(v)) }) })
       toast.success(`Access updated for "${showAccess}"`)
       setExpanded(e => ({ ...e, [showAccess]: true }))
       setShowAccess(null); load()
@@ -467,8 +441,7 @@ export default function Files() {
         </div>
         <div className="ml-auto flex items-center gap-2 flex-wrap">
           <Input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search files…" aria-label="Search files" className="w-44" />
-          <Button variant="secondary" onClick={() => load()} title="Refresh"><RefreshCw size={15} /></Button>
-          {canUseFinder && (
+          {isAdmin && onServerMachine && (
             <Button variant="secondary" onClick={() => reveal()} title="Open shared root in Finder / File Explorer (server machine)">
               <span className="flex items-center gap-1.5"><FolderSearch size={14} /> Finder</span>
             </Button>
@@ -521,16 +494,17 @@ export default function Files() {
                   <p className="text-xs text-[var(--muted)] truncate">{selected}</p>
                 </div>
                 <div className="ml-auto flex gap-2 flex-wrap">
+                  {isAdmin && onServerMachine && <Button variant="secondary" onClick={() => reveal(selected)} title="Reveal in Finder / File Explorer (server machine)"><span className="flex items-center gap-1.5"><FolderSearch size={14} /> Reveal</span></Button>}
                   <Button onClick={() => downloadFile(selected)}><span className="flex items-center gap-1.5"><Download size={14} /> Download</span></Button>
-                  <Link to={`/files/discussion?path=${encodeURIComponent(selected)}`}>
-                    <Button variant="secondary"><span className="flex items-center gap-1.5"><MessageSquare size={14} /> Discuss</span></Button>
-                  </Link>
-                  <Button variant="destructive" onClick={() => setConfirmDelete({ path: selected, isDir: false })} title="Delete this file"><span className="flex items-center gap-1.5"><Trash2 size={14} /> Delete</span></Button>
+                  {canEditPath(selected)
+                    ? <Button variant="destructive" onClick={() => setConfirmDelete({ path: selected, isDir: false })} title="Delete this file"><span className="flex items-center gap-1.5"><Trash2 size={14} /> Delete</span></Button>
+                    : <span className="text-xs text-[var(--muted)] self-center">view-only</span>}
                 </div>
               </div>
               <div className="flex gap-1 text-sm border-b border-[var(--border)]">
                 <button onClick={() => setTab('versions')} className={`px-3 py-1.5 flex items-center gap-1.5 ${tab === 'versions' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)] font-medium' : 'text-[var(--muted)]'}`}><History size={13} /> Versions</button>
                 <button onClick={() => setTab('activity')} className={`px-3 py-1.5 flex items-center gap-1.5 ${tab === 'activity' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)] font-medium' : 'text-[var(--muted)]'}`}><Activity size={13} /> Audit</button>
+                <button onClick={() => setTab('discussion')} className={`px-3 py-1.5 flex items-center gap-1.5 ${tab === 'discussion' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)] font-medium' : 'text-[var(--muted)]'}`}><MessageSquare size={13} /> Discussion</button>
               </div>
               {tab === 'versions' ? (
                 <div>
@@ -543,15 +517,25 @@ export default function Files() {
                           <span className="text-[var(--muted)]">{v.size} bytes · by {v.by}</span>
                           <span className="ml-auto text-[var(--muted)]">{new Date(v.at).toLocaleString()}</span>
                         </div>
+                        {v.restorable && (
+                          <div className="flex gap-2 mt-1.5">
+                            <button className="text-[var(--accent)] hover:underline" onClick={() => downloadFile(selected, v.version)}>Download v{v.version}</button>
+                            {v.version !== versions[versions.length - 1]?.version && canEditPath(selected) && (
+                              <button className="text-[var(--accent)] hover:underline" onClick={() => resolve(selected, 'version', v.version)}>Restore this version</button>
+                            )}
+                          </div>
+                        )}
                       </div>
                     ))}
                     {versions.length === 0 && <p className="text-xs text-[var(--muted)]">No versions recorded yet.</p>}
                   </div>
-                  <div className="flex gap-2 mt-2">
+                  {canEditPath(selected) && <div className="flex gap-2 mt-2">
                     <Button variant="secondary" onClick={() => resolve(selected, 'latest')}><span className="flex items-center gap-1.5"><ShieldCheck size={14} /> Keep latest</span></Button>
                     <Button variant="secondary" onClick={() => resolve(selected, 'keep-mine')}>Keep mine</Button>
-                  </div>
+                  </div>}
                 </div>
+              ) : tab === 'discussion' ? (
+                <FileDiscussionPanel path={selected} />
               ) : (
                 <div className="space-y-1.5 max-h-64 overflow-auto">
                   {activity.map(a => (
@@ -633,13 +617,20 @@ export default function Files() {
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={() => setShowAccess(null)}>
           <div className="w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4" onClick={e => e.stopPropagation()}>
             <h3 className="font-bold mb-1">Access: {showAccess}</h3>
-            <p className="text-xs text-[var(--muted)] mb-3">Only picked members (+ admins) see this subfolder. Empty = public.</p>
+            <p className="text-xs text-[var(--muted)] mb-3">Only picked members (+ admins) see this subfolder. Empty = public. Untick “can edit” for view/download-only access.</p>
             <div className="max-h-56 overflow-auto space-y-1 mb-3">
               {users.filter(u => u.username !== user).map(u => (
                 <label key={u.username} className="flex items-center gap-2 text-sm rounded-lg px-2 py-1.5 hover:bg-[var(--card-hover)] cursor-pointer">
                   <input type="checkbox" checked={accessPick.includes(u.username)}
                     onChange={() => setAccessPick(p => p.includes(u.username) ? p.filter(x => x !== u.username) : [...p, u.username])} />
                   {u.username} <span className="text-xs text-[var(--muted)]">{u.role}</span>
+                  {accessPick.includes(u.username) && (
+                    <span className="ml-auto flex items-center gap-1 text-xs" onClick={e => e.stopPropagation()}>
+                      <input type="checkbox" checked={!accessViewOnly.includes(u.username)}
+                        onChange={() => setAccessViewOnly(v => v.includes(u.username) ? v.filter(x => x !== u.username) : [...v, u.username])} />
+                      can edit
+                    </span>
+                  )}
                 </label>
               ))}
               {users.length === 0 && <p className="text-xs text-[var(--muted)]">No other users yet.</p>}

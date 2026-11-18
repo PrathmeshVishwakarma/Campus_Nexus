@@ -1,9 +1,17 @@
 __pycache__/
-*.db
 *.pyc
+.pytest_cache/
 venv/
+.venv/
 .env
+!.env.example
+*.db
+pgdata/
+backend/data/
 node_modules/
 dist/
-pgdata/
+# tsc must never emit next to sources (Vite would load the stale .js first)
+frontend/src/**/*.js
+.DS_Store
+.nexus_agent_state.json
 vapid_private.pem

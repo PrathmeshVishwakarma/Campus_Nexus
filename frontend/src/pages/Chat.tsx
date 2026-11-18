@@ -1,22 +1,20 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Link, useSearchParams } from 'react-router-dom'
-import { MoreVertical, LogOut, Pencil, Plus, Send, Trash2, UserCheck, UserMinus, UserPlus, X } from 'lucide-react'
+
+import { BellOff, LogOut, MoreVertical, Pencil, Plus, Send, Trash2, UserCheck, UserMinus, UserPlus, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, useAuth } from '../store/useAuth'
+import { useNexusEvents } from '../hooks/useNexusEvents'
 import { Card } from '../components/ui/card'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 
-type Ch = { id: number; name: string; type: string; members: string[] }
-type M = { id: number; sender: string; content: string; file_link: string; read: boolean; created_at: string }
+type Ch = { id: number; name: string; type: string; members: string[]; created_by?: string | null; unread?: number; muted?: boolean }
+type M = { id: number; sender: string; content: string; file_link: string; read: boolean; read_by?: string[]; read_by_all?: boolean; created_at: string; pending?: boolean }
 type User = { username: string; email: string }
 
 export default function Chat() {
-  const { user, token } = useAuth()
-  const [params, setParams] = useSearchParams()
-  const fileParam = params.get('file') || ''
-  const [isAdmin, setIsAdmin] = useState(false)
+  const { user, token, role } = useAuth()
 
   const [channels, setChannels] = useState<Ch[]>([])
   const [cid, setCid] = useState<number | null>(null)
@@ -29,7 +27,7 @@ export default function Chat() {
   const [newName, setNewName] = useState('')
   const [newType, setNewType] = useState('group')
   const [picked, setPicked] = useState<string[]>([])
-  const [fileFilter, setFileFilter] = useState(fileParam)
+  const [leaveId, setLeaveId] = useState<number | null>(null)
   // 3-dot manage menu (fixed-position pop-out so the scrolling
   // channel list never clips it) + modals
   const [menu, setMenu] = useState<{ id: number; top?: number; bottom?: number; left: number } | null>(null)
@@ -49,7 +47,6 @@ export default function Chat() {
   const [addId, setAddId] = useState<number | null>(null)
   const [addPick, setAddPick] = useState<string[]>([])
   const [removeId, setRemoveId] = useState<number | null>(null)
-  const [leaveId, setLeaveId] = useState<number | null>(null)
   const [del, setDel] = useState<{ id: number; name: string; count: number } | null>(null)
   // Typing indicator: map of username → timeout handle
   const [typingUsers, setTypingUsers] = useState<Record<string, boolean>>({})
@@ -64,6 +61,8 @@ export default function Chat() {
   }, [msgs, cid])
 
   const auth = { headers: { Authorization: `Bearer ${token}` } }
+  const cidRef = useRef(cid)
+  cidRef.current = cid
 
   const loadUsers = async () => {
     try { setUsers(await api('/api/auth/users', auth)) } catch { /* optional */ }
@@ -73,15 +72,11 @@ export default function Chat() {
     try {
       const res: Ch[] = await api('/api/messages/channels', auth)
       setChannels(res)
-      if (!cid && res[0]) setCid(res[0].id)
-      // unread badges
+      if (!cidRef.current && res[0]) setCid(res[0].id)
+      if (cidRef.current && !res.some(c => c.id === cidRef.current)) { setCid(res[0]?.id ?? null); setMsgs([]) }
+      // unread badges come with the channel list (one request, not one per channel)
       const counts: Record<number, number> = {}
-      await Promise.all(res.map(async c => {
-        try {
-          const r = await api(`/api/messages/unread/count?channel_id=${c.id}`, auth)
-          counts[c.id] = r.unread ?? 0
-        } catch { counts[c.id] = 0 }
-      }))
+      res.forEach(c => { counts[c.id] = c.unread ?? 0 })
       setUnread(counts)
     } catch (e: any) { if (!silent) toast.error(e.message) }
   }
@@ -89,8 +84,9 @@ export default function Chat() {
   const loadMsg = async (silent = false) => {
     if (!cid) return
     try {
-      const q = fileFilter ? `&file_link=${encodeURIComponent(fileFilter)}` : ''
-      setMsgs(await api(`/api/messages?channel_id=${cid}${q}`, auth))
+      const rows: M[] = await api(`/api/messages?channel_id=${cid}`, auth)
+      // keep my not-yet-confirmed messages at the bottom
+      setMsgs(prev => [...rows, ...prev.filter(m => m.pending)])
     } catch (e: any) {
       if (!silent) { toast.error(e.message); return }
       // silent (live) path: channel may have been deleted elsewhere —
@@ -104,22 +100,11 @@ export default function Chat() {
 
   // Refs so one long-lived socket/interval always sees the current selection
   // without reconnecting on every channel switch.
-  const cidRef = useRef(cid)
-  cidRef.current = cid
-  const fileRef = useRef(fileFilter)
-  fileRef.current = fileFilter
   const userRef = useRef(user)
   userRef.current = user
 
   useEffect(() => { loadCh(); loadUsers() }, [])
-  useEffect(() => {
-    api('/api/auth/me', auth)
-      .then(me => setIsAdmin((me?.role || '').toLowerCase() === 'admin'))
-      .catch(() => {})
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token])
-  useEffect(() => { loadMsg() }, [cid, fileFilter])
-  useEffect(() => { setFileFilter(fileParam) }, [fileParam])
+  useEffect(() => { setMsgs([]); loadMsg() }, [cid])
 
   // Keep latest loaders in refs so the long-lived socket/poll never
   // call a stale closure (the old bug: interval captured cid=null from
@@ -129,81 +114,40 @@ export default function Chat() {
   const loadMsgRef = useRef(loadMsg)
   loadMsgRef.current = loadMsg
 
-  // Live updates: WebSocket MESSAGE_SENT events for instant refresh,
-  // plus a quiet 4s poll as fallback if the socket drops.
-  useEffect(() => {
-    let alive = true
-    let ws: WebSocket | null = null
-    let retry = 0
-    let retryTimer: ReturnType<typeof setTimeout> | null = null
-    let pingTimer: ReturnType<typeof setInterval> | null = null
-    const onEvent = (raw: string) => {
-      try {
-        const e = JSON.parse(raw)
-        if (e.event === 'TYPING') {
-          const chId = e.data?.payload?.channel_id ?? e.data?.channel_id
-          const actor: string = e.data?.actor || ''
-          if (chId === cidRef.current && actor !== userRef.current) {
-            setTypingUsers(prev => ({ ...prev, [actor]: true }))
-            clearTimeout(typingTimers.current[actor])
-            typingTimers.current[actor] = setTimeout(() => {
-              setTypingUsers(prev => { const n = { ...prev }; delete n[actor]; return n })
-            }, 3000)
-          }
-          return
-        }
-        if (e.event === 'PONG') return
-        if (e.event !== 'MESSAGE_SENT') return
-        const resource: string = e.data?.resource || ''
-        const m = resource.match(/^channel:(\d+)/)
-        // channel list can change on any message event (new/renamed/deleted channel)
-        loadChRef.current(true)
-        if (m && Number(m[1]) === cidRef.current) loadMsgRef.current(true)
-      } catch { /* ignore malformed frames */ }
-    };
-    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
-    const connect = () => {
-      if (!alive) return
-      try {
-        ws = new WebSocket(`${scheme}://${location.host}/ws/events?token=${token}`)
-      } catch { scheduleRetry(); return }
-      ws.onopen = () => { retry = 0 }
-      ws.onmessage = (msg) => { if (alive) onEvent(msg.data) }
-      ws.onerror = () => { try { ws?.close() } catch {} }
-      ws.onclose = () => { scheduleRetry() }
-    }
-    const scheduleRetry = () => {
-      if (!alive) return
-      if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
-      retry = Math.min(retry + 1, 5)
-      const delay = Math.min(1000 * 2 ** retry, 10000)
-      if (retryTimer) clearTimeout(retryTimer)
-      retryTimer = setTimeout(() => { if (alive) connect() }, delay)
-    }
-    connect()
-    // heartbeat keeps Vite's dev proxy + idle connections alive
-    pingTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try { ws.send(JSON.stringify({ action: 'PING' })) } catch {}
+  // Live updates over the app's single shared socket. The server only sends
+  // events for channels this user belongs to. Poll only while it is down.
+  const { connected } = useNexusEvents((e) => {
+    if (e.event === 'TYPING') {
+      const chId = e.data?.payload?.channel_id
+      const actor: string = e.data?.actor || ''
+      if (chId === cidRef.current && actor !== userRef.current) {
+        setTypingUsers(prev => ({ ...prev, [actor]: true }))
+        clearTimeout(typingTimers.current[actor])
+        typingTimers.current[actor] = setTimeout(() => {
+          setTypingUsers(prev => { const n = { ...prev }; delete n[actor]; return n })
+        }, 3000)
       }
-    }, 25000)
-    const poll = setInterval(() => {
-      if (alive && !document.hidden) { loadChRef.current(true); loadMsgRef.current(true) }
-    }, 4000)
-    return () => {
-      alive = false
-      clearInterval(poll)
-      if (pingTimer) clearInterval(pingTimer)
-      if (retryTimer) clearTimeout(retryTimer)
-      try { ws?.close() } catch {}
+      return
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token])
+    if (e.event !== 'MESSAGE_SENT' && e.event !== 'MESSAGE_READ') return
+    const m = (e.data?.resource || '').match(/^channel:(\d+)/)
+    loadChRef.current(true)
+    if (m && Number(m[1]) === cidRef.current) loadMsgRef.current(true)
+  }, token)
 
   useEffect(() => {
-    msgs.filter(m => !m.read && m.sender !== user).forEach(m => {
-      api(`/api/messages/${m.id}/read`, { ...auth, method: 'PATCH' }).catch(() => {})
-    })
+    if (connected) return
+    const poll = setInterval(() => {
+      if (!document.hidden) { loadChRef.current(true); loadMsgRef.current(true) }
+    }, 5000)
+    return () => clearInterval(poll)
+  }, [connected])
+
+  // mark the open channel read in one call when unread messages from others are shown
+  useEffect(() => {
+    if (!cid || !msgs.some(m => !m.read && m.sender !== user)) return
+    api(`/api/messages/read?channel_id=${cid}`, { ...auth, method: 'POST' })
+      .then(() => setUnread(u => ({ ...u, [cid]: 0 }))).catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [msgs])
 
@@ -215,14 +159,36 @@ export default function Chat() {
     }, 300)
   }
 
+  // optimistic send: show immediately, swap in the server's copy, roll back on failure
   const send = async () => {
-    if (!text.trim() || !cid) return
-    const t = text; setText('')
+    const t = text.trim()
+    if (!t || !cid) return
+    setText('')
+    const tempId = -Date.now()
+    setMsgs(m => [...m, { id: tempId, sender: user, content: t, file_link: '', read: false, created_at: new Date().toISOString(), pending: true }])
     try {
-      await api('/api/messages', { ...auth, method: 'POST', body: JSON.stringify({ channel_id: cid, content: t, file_link: fileFilter }) })
-      loadMsg(); loadCh()
-    } catch (e: any) { toast.error(e.message); setText(t) }
+      const saved: M = await api('/api/messages', { ...auth, method: 'POST', body: JSON.stringify({ channel_id: cid, content: t }) })
+      setMsgs(m => m.some(x => x.id === saved.id) ? m.filter(x => x.id !== tempId) : m.map(x => x.id === tempId ? saved : x))
+    } catch (e: any) {
+      setMsgs(m => m.filter(x => x.id !== tempId))
+      setText(t)
+      toast.error(e.message)
+    }
   }
+
+  const doLeave = async () => {
+    if (leaveId == null) return
+    try {
+      await api(`/api/messages/channels/${leaveId}/members`, { ...auth, method: 'POST', body: JSON.stringify({ remove: [user] }) })
+      toast.success('You left the conversation')
+      if (cid === leaveId) { setCid(null); setMsgs([]) }
+      setLeaveId(null)
+      loadCh()
+    } catch (e: any) { toast.error(e.message) }
+  }
+
+  // creator, admins, or either side of a DM may delete; anyone may leave a group
+  const canManage = (c: Ch) => role === 'admin' || c.type === 'dm' || !c.created_by || c.created_by === user
 
   const togglePick = (u: string) => {
     setPicked(p => p.includes(u) ? p.filter(x => x !== u) : [...p, u])
@@ -248,7 +214,7 @@ export default function Chat() {
   const toggleMenu = (c: Ch, e: React.MouseEvent<HTMLButtonElement>) => {
     if (menu?.id === c.id) { setMenu(null); return }
     const r = e.currentTarget.getBoundingClientRect()
-    const MENU_H = isAdmin ? 190 : 160 // approx height of the menu
+    const MENU_H = 152 // approx height of the 4-item menu
     const left = Math.min(Math.max(8, r.right - 176), Math.max(8, window.innerWidth - 184))
     if (window.innerHeight - r.bottom < MENU_H + 8) {
       // no room below the button — pop upward, hugging the button
@@ -284,17 +250,6 @@ export default function Chat() {
       await api(`/api/messages/channels/${removeId}/members`, { ...auth, method: 'POST', body: JSON.stringify({ remove: [member] }) })
       toast.success(`${member} removed`)
       if (channels.find(c => c.id === removeId)?.members.length === 2) setRemoveId(null)
-      loadCh()
-    } catch (e: any) { toast.error(e.message) }
-  }
-
-  const doLeave = async () => {
-    if (leaveId == null) return
-    try {
-      await api(`/api/messages/channels/${leaveId}/members`, { ...auth, method: 'POST', body: JSON.stringify({ remove: [user] }) })
-      toast.success('Left the channel')
-      if (cid === leaveId) { setCid(null); setMsgs([]) }
-      setLeaveId(null); setMenu(null)
       loadCh()
     } catch (e: any) { toast.error(e.message) }
   }
@@ -358,16 +313,18 @@ export default function Chat() {
               className={`w-full px-3 py-2 rounded-xl text-sm flex items-center gap-2 transition-colors ${cid === c.id ? 'bg-[rgba(139,92,246,0.15)]' : 'hover:bg-[var(--card-hover)]'}`}
             >
               <button
-                onClick={() => { setCid(c.id); setParams(fileParam ? { file: fileParam } : {}); setMenu(null) }}
+                onClick={() => { setCid(c.id); setMenu(null) }}
                 className="flex-1 min-w-0 text-left flex items-center gap-2"
                 aria-label={`Open ${c.name}`}
               >
                 <span className="text-[var(--accent)]">#</span>
                 <span className="font-medium truncate">{c.name}</span>
                 <span className="text-xs text-[var(--muted)]">{c.type}</span>
-                {(unread[c.id] ?? 0) > 0 && (
-                  <span className="text-[11px] font-bold rounded-full bg-[var(--accent)] text-white px-2 py-0.5">{unread[c.id]}</span>
-                )}
+                {c.muted
+                  ? <BellOff size={12} className="text-[var(--muted)]" aria-label="muted" />
+                  : (unread[c.id] ?? 0) > 0 && (
+                    <span className="text-[11px] font-bold rounded-full bg-[var(--accent)] text-white px-2 py-0.5">{unread[c.id]}</span>
+                  )}
                 {cid === c.id && <UserCheck size={13} className="text-emerald-400" />}
               </button>
               <button
@@ -396,12 +353,10 @@ export default function Chat() {
                 style={{ top: menu.top, bottom: menu.bottom, left: menu.left }}
               >
                 <button onClick={() => { setRename({ id: c.id, name: c.name }); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><Pencil size={13} /> Rename</button>
-                <button onClick={() => { setAddId(c.id); setAddPick([]); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><UserPlus size={13} /> Add person</button>
-                <button onClick={() => { setRemoveId(c.id); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><UserMinus size={13} /> Remove person</button>
-                <button onClick={() => { setLeaveId(c.id); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><LogOut size={13} /> Leave channel</button>
-                {isAdmin && (
-                  <button onClick={() => openDelete(c)} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[rgba(239,68,68,0.15)] text-left text-red-400"><Trash2 size={13} /> Delete…</button>
-                )}
+                {c.type !== 'dm' && <button onClick={() => { setAddId(c.id); setAddPick([]); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><UserPlus size={13} /> Add person</button>}
+                {c.type !== 'dm' && canManage(c) && <button onClick={() => { setRemoveId(c.id); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><UserMinus size={13} /> Remove person</button>}
+                {c.type !== 'dm' && <button onClick={() => { setLeaveId(c.id); setMenu(null) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[var(--card-hover)] text-left"><LogOut size={13} /> Leave</button>}
+                {canManage(c) && <button onClick={() => openDelete(c)} className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-[rgba(239,68,68,0.15)] text-left text-red-400"><Trash2 size={13} /> Delete…</button>}
               </div>
             </>,
             document.body
@@ -417,30 +372,22 @@ export default function Chat() {
             <div className="flex items-center gap-2 flex-wrap pb-3 border-b border-[var(--border)] mb-3">
               <h2 className="font-bold">#{active?.name}</h2>
               <span className="text-xs text-[var(--muted)]">{active?.type} · {active?.members.join(', ')}</span>
-              {fileFilter ? (
-                <span className="ml-auto text-xs rounded-full bg-[rgba(139,92,246,0.15)] text-[var(--accent)] px-2 py-1">
-                  File thread: {fileFilter}
-                  <button onClick={() => { setFileFilter(''); setParams({}) }} className="ml-1 underline">clear</button>
-                  <Link to={`/files`} className="ml-2 underline">open file</Link>
-                </span>
-              ) : (
-                <span className="ml-auto text-xs text-[var(--muted)]">Tip: open a file in Files → “Open in Chat” to discuss it here.</span>
-              )}
+              <span className="ml-auto text-xs text-[var(--muted)]">File discussions live in Files → Discussion.</span>
             </div>
             <div ref={msgListRef} className="flex-1 space-y-2 overflow-auto mb-3 max-h-[380px]">
               {msgs.map(m => (
-                <div key={m.id} className="rounded-xl bg-[var(--card)] p-3 text-sm">
+                <div key={m.id} className={`rounded-xl bg-[var(--card)] p-3 text-sm ${m.pending ? 'opacity-60' : ''}`}>
                   <span className="font-medium">{m.sender}</span>
                   {m.file_link && <span className="ml-2 text-xs text-[var(--accent)]">📎 {m.file_link}</span>}
                   <div className="mt-0.5">{m.content}</div>
                   <div className="text-[11px] text-[var(--muted)] mt-1 flex items-center gap-1.5">
-                    {new Date(m.created_at).toLocaleString()}
+                    {m.pending ? 'sending…' : new Date(m.created_at).toLocaleString()}
                     {/* ✓✓ delivery ticks */}
-                    {m.sender === user && (
+                    {m.sender === user && !m.pending && (
                       <span
                         className="font-bold"
                         style={{ color: m.read ? 'var(--accent)' : 'var(--muted)' }}
-                        title={m.read ? 'Read' : 'Delivered'}
+                        title={m.read_by && m.read_by.length ? `Read by ${m.read_by.join(', ')}${m.read_by_all ? ' (everyone)' : ''}` : 'Delivered'}
                       >
                         {m.read ? '✓✓' : '✓'}
                       </span>
@@ -448,7 +395,7 @@ export default function Chat() {
                   </div>
                 </div>
               ))}
-              {msgs.length === 0 && <p className="text-xs text-[var(--muted)] text-center py-8">No messages{fileFilter ? ' in this file thread' : ''} — say hello.</p>}
+              {msgs.length === 0 && <p className="text-xs text-[var(--muted)] text-center py-8">No messages — say hello.</p>}
               <div ref={msgEndRef} />
             </div>
             {/* Typing indicator */}
@@ -467,7 +414,7 @@ export default function Chat() {
                 value={text}
                 onChange={e => { setText(e.target.value); sendTyping() }}
                 onKeyDown={e => e.key === 'Enter' && send()}
-                placeholder={fileFilter ? `Reply in thread ${fileFilter}…` : 'Message…'}
+                placeholder="Message…"
                 aria-label="Message input"
               />
               <Button onClick={send}><span className="flex items-center gap-1.5"><Send size={14} /> Send</span></Button>
@@ -517,7 +464,7 @@ export default function Chat() {
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={() => setRemoveId(null)}>
           <div className="w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4" onClick={e => e.stopPropagation()}>
             <h3 className="font-bold mb-1">Remove person</h3>
-            <p className="text-xs text-[var(--muted)] mb-3">Use “Leave channel” to exit a conversation yourself.</p>
+            <p className="text-xs text-[var(--muted)] mb-3">You cannot remove yourself — delete the channel instead.</p>
             <div className="space-y-1 mb-3">
               {(channels.find(c => c.id === removeId)?.members || []).filter(m => m !== user).map(m => (
                 <div key={m} className="flex items-center gap-2 text-sm rounded-lg px-2 py-1.5">
@@ -538,7 +485,7 @@ export default function Chat() {
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={() => setLeaveId(null)}>
           <div className="w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4" onClick={e => e.stopPropagation()}>
             <h3 className="font-bold mb-1">Leave “{channels.find(c => c.id === leaveId)?.name}”?</h3>
-            <p className="text-sm text-[var(--muted)] mb-3">You will stop seeing this conversation. Messages are kept for the remaining members.</p>
+            <p className="text-sm text-[var(--muted)] mb-3">You stop seeing this conversation. Messages stay for the others (if you're the last member, it is deleted).</p>
             <div className="flex gap-2">
               <Button variant="secondary" onClick={() => setLeaveId(null)} className="flex-1">Cancel</Button>
               <Button variant="destructive" onClick={doLeave} className="flex-1">Leave</Button>
@@ -546,7 +493,6 @@ export default function Chat() {
           </div>
         </div>
       )}
-
       {del && (
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onClick={() => setDel(null)}>
           <div className="w-full max-w-sm rounded-2xl border border-red-500/40 bg-[var(--card)] p-4" onClick={e => e.stopPropagation()}>

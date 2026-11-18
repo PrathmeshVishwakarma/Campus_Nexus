@@ -6,14 +6,14 @@ from pathlib import Path
 
 from app.core.config import settings
 
-BACKEND_DIR = Path(__file__).resolve().parents[2]
-_DEFAULT_KEY_FILE = BACKEND_DIR / "vapid_private.pem"
-
 _vapid = None
 
 
 def _key_file() -> Path:
-    return Path(settings.vapid_private_key_file) if settings.vapid_private_key_file else _DEFAULT_KEY_FILE
+    # Keep the private key with the other server secrets (data_dir), never in the repo.
+    if settings.vapid_private_key_file:
+        return Path(settings.vapid_private_key_file)
+    return settings.data_path / "vapid_private.pem"
 
 
 def _load_vapid():

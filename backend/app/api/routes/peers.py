@@ -1,61 +1,75 @@
-from datetime import datetime
-
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.routes.auth import get_current_user
+from app.core.config import settings
 from app.core.network import net_io_snapshot
+from app.core.timeutil import utcnow
 from app.db.models.models import Peer
 from app.db.session import get_db
 from app.services import scheduler
 from app.services.peer_discovery import broadcast_hello
 
 router = APIRouter(prefix="/api", tags=["network"])
+STALE_AFTER_S = 60
 
 
 class Heartbeat(BaseModel):
-    hostname: str
-    ip: str
-    latency_ms: float = 0.0
+    hostname: str = Field(min_length=1, max_length=128)
+    ip: str = Field(default="", max_length=64)
+    latency_ms: float = Field(default=0.0, ge=0)
+
+
+def mark_stale(db: Session) -> list[Peer]:
+    peers = db.query(Peer).all()
+    now = utcnow()
+    changed = False
+    for p in peers:
+        if (now - p.last_seen).total_seconds() > STALE_AFTER_S and p.status != "offline":
+            p.status = "offline"
+            changed = True
+    if changed:
+        db.commit()
+    return peers
 
 
 @router.get("/peers")
 def peers(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    mark_stale(db)
     return [{"hostname": p.hostname, "ip": p.ip, "status": p.status,
              "latency_ms": p.latency_ms, "last_seen": p.last_seen.isoformat()}
             for p in db.query(Peer).order_by(Peer.last_seen.desc()).all()]
 
 
 @router.post("/peers/heartbeat")
-def heartbeat(data: Heartbeat, db: Session = Depends(get_db)):
+def heartbeat(data: Heartbeat, request: Request, db: Session = Depends(get_db),
+              user=Depends(get_current_user)):
+    # Prefer the address we actually see; fall back to what the agent reports.
+    seen_ip = request.client.host if request.client else ""
+    ip = data.ip if (data.ip and seen_ip in ("127.0.0.1", "::1", "testclient", "")) else (seen_ip or data.ip)
     p = db.query(Peer).filter(Peer.hostname == data.hostname).first()
     if not p:
-        p = Peer(hostname=data.hostname, ip=data.ip)
+        p = Peer(hostname=data.hostname, ip=ip)
         db.add(p)
-    p.ip = data.ip
+    p.ip = ip
     p.latency_ms = data.latency_ms
     p.status = "online"
-    p.last_seen = datetime.utcnow()
+    p.last_seen = utcnow()
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "ip": ip}
 
 
 @router.post("/peers/discover")
 def discover(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    broadcast_hello()
+    broadcast_hello(settings.discovery_port)
     return {"ok": True, "msg": "hello broadcasted"}
 
 
 @router.get("/network/graph")
 def graph(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    peers = db.query(Peer).all()
-    # stale >60s without heartbeat => offline
-    now = datetime.utcnow()
-    for p in peers:
-        if (now - p.last_seen).total_seconds() > 60:
-            p.status = "offline"
-    db.commit()
+    peers = mark_stale(db)
+    now = utcnow()
     nodes = [{"id": p.hostname, "ip": p.ip, "latency": p.latency_ms, "status": p.status,
               "last_seen": p.last_seen.isoformat()} for p in peers]
     nodes.append({"id": "server", "ip": "127.0.0.1", "latency": 0.5, "status": "online",

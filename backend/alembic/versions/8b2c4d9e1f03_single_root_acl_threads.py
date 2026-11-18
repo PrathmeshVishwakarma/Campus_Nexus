@@ -15,8 +15,15 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _has(name: str) -> bool:
+    return sa.inspect(op.get_bind()).has_table(name)
+
+
 def upgrade() -> None:
-    op.create_table(
+    # Older builds created these tables via Base.metadata.create_all() without
+    # stamping alembic, so skip any table that already exists.
+    if not _has('root_config'):
+      op.create_table(
         'root_config',
         sa.Column('id', sa.Integer(), nullable=False),
         sa.Column('path', sa.String(length=1024), nullable=False),
@@ -24,7 +31,8 @@ def upgrade() -> None:
         sa.Column('updated_at', sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint('id'),
     )
-    op.create_table(
+    if not _has('folder_acl'):
+      op.create_table(
         'folder_acl',
         sa.Column('id', sa.Integer(), nullable=False),
         sa.Column('subfolder', sa.String(length=512), nullable=False),
@@ -33,8 +41,9 @@ def upgrade() -> None:
         sa.Column('updated_at', sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint('id'),
     )
-    op.create_index(op.f('ix_folder_acl_subfolder'), 'folder_acl', ['subfolder'], unique=True)
-    op.create_table(
+      op.create_index(op.f('ix_folder_acl_subfolder'), 'folder_acl', ['subfolder'], unique=True)
+    if not _has('file_threads'):
+      op.create_table(
         'file_threads',
         sa.Column('id', sa.Integer(), nullable=False),
         sa.Column('file_path', sa.String(length=512), nullable=False),
@@ -42,8 +51,9 @@ def upgrade() -> None:
         sa.Column('created_at', sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint('id'),
     )
-    op.create_index(op.f('ix_file_threads_file_path'), 'file_threads', ['file_path'], unique=True)
-    op.create_table(
+      op.create_index(op.f('ix_file_threads_file_path'), 'file_threads', ['file_path'], unique=True)
+    if not _has('file_comments'):
+      op.create_table(
         'file_comments',
         sa.Column('id', sa.Integer(), nullable=False),
         sa.Column('thread_id', sa.Integer(), nullable=False),
@@ -53,7 +63,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(['thread_id'], ['file_threads.id']),
         sa.PrimaryKeyConstraint('id'),
     )
-    op.create_index(op.f('ix_file_comments_thread_id'), 'file_comments', ['thread_id'], unique=False)
+      op.create_index(op.f('ix_file_comments_thread_id'), 'file_comments', ['thread_id'], unique=False)
 
 
 def downgrade() -> None:
