@@ -3,8 +3,18 @@ import { Wifi, Signal, Clock } from 'lucide-react'
 import { toast } from 'sonner'
 import * as d3 from 'd3'
 import { api, useAuth } from '../store/useAuth'
+import { useNexusEvents } from '../hooks/useNexusEvents'
 
-type Node = { id: string; ip: string; latency: number; status: string; last_seen: string }
+type Node = {
+  id: string
+  label?: string
+  role?: string
+  connections?: number
+  ip: string
+  latency: number
+  status: string
+  last_seen: string
+}
 type Edge = { from: string; to: string; latency: number }
 type GraphData = {
   nodes: Node[]
@@ -24,6 +34,7 @@ export default function Network() {
   const { token } = useAuth()
   const [graph, setGraph] = useState<GraphData | null>(null)
   const [stats, setStats] = useState<Stats | null>(null)
+  const graphJson = useRef('')
 
   const load = async () => {
     try {
@@ -31,7 +42,12 @@ export default function Network() {
         api('/api/network/graph', { headers: { Authorization: `Bearer ${token}` } }),
         api('/api/network/stats', { headers: { Authorization: `Bearer ${token}` } })
       ])
-      setGraph(g as GraphData)
+      // Only rebuild the force graph when the topology actually changed.
+      const next = JSON.stringify(g)
+      if (next !== graphJson.current) {
+        graphJson.current = next
+        setGraph(g as GraphData)
+      }
       setStats(s as Stats)
     } catch (e: any) {
       toast.error(e.message)
@@ -44,18 +60,10 @@ export default function Network() {
     return () => clearInterval(interval)
   }, [])
 
-  const discover = async () => {
-    try {
-      await api('/api/peers/discover', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        body: JSON.stringify({})
-      })
-      setTimeout(load, 1500)
-    } catch (e: any) {
-      toast.error(e.message)
-    }
-  }
+  // Presence is pushed over the shared WebSocket the moment someone joins/leaves.
+  const { connected } = useNexusEvents((e) => {
+    if (e.event === 'PRESENCE') load()
+  })
 
   function getPriorityColor(priority: number) {
     if (priority >= 80) return 'var(--error)'
@@ -76,12 +84,10 @@ export default function Network() {
       <div className="flex items-center gap-2">
         <Wifi size={16} className="text-[var(--accent)]" />
         <h1 className="text-xl font-bold tracking-tight">Network topology</h1>
-        <button
-          onClick={discover}
-          className="ml-auto rounded-lg px-3 py-1.5 text-xs font-medium bg-[var(--accent)] text-white hover:opacity-90 transition-opacity"
-        >
-          Discover
-        </button>
+        <span className={`ml-auto inline-flex items-center gap-1.5 rounded-full border border-[var(--border)] px-2.5 py-1 text-xs ${connected ? 'text-[var(--success)]' : 'text-[var(--muted)]'}`}>
+          <span className={`h-2 w-2 rounded-full ${connected ? 'bg-[var(--success)] animate-pulse' : 'bg-[var(--muted)]'}`} />
+          {connected ? 'Live' : 'Reconnecting'}
+        </span>
       </div>
 
       <div className="grid md:grid-cols-2 gap-4">
@@ -90,8 +96,27 @@ export default function Network() {
           {graph ? <ForceGraph graph={graph} /> : (
             <div className="p-8 text-[var(--muted)] text-center text-sm">
               <Signal className="w-12 h-12 mx-auto mb-4 opacity-30" />
-              <p>No peers discovered yet</p>
-              <p className="mt-2 text-xs">Click "Discover" to find nodes on the LAN</p>
+              <p>Waiting for presence…</p>
+            </div>
+          )}
+          {graph && (
+            <div className="border-t border-[var(--border)] px-4 py-3">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Online now</h3>
+                <span className="text-xs text-[var(--muted)]">{graph.nodes.filter(n => n.id !== 'server').length} client{graph.nodes.filter(n => n.id !== 'server').length === 1 ? '' : 's'}</span>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {graph.nodes.filter(n => n.id !== 'server').map(n => (
+                  <span key={n.id} className="inline-flex items-center gap-1.5 rounded-full bg-[var(--card-hover)] px-2 py-1 text-xs">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--success)]" />
+                    <span className="font-medium">{n.label || n.id}</span>
+                    {n.role && <span className="text-[var(--muted)] capitalize">{n.role}</span>}
+                  </span>
+                ))}
+                {graph.nodes.filter(n => n.id !== 'server').length === 0 && (
+                  <span className="text-xs text-[var(--muted)]">Open the app on another device and it will appear here.</span>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -232,11 +257,15 @@ function ForceGraph({ graph }: { graph: GraphData }) {
       .attr('r', d => d.id === graph.central ? 14 : graph.isolated.includes(d.id) ? 8 : 10)
       .attr('fill', d => d.id === graph.central ? 'var(--accent)' : graph.isolated.includes(d.id) ? 'var(--error)' : 'var(--success)')
 
+    node.append('title').text(d => d.id === graph.central
+      ? 'server'
+      : `${d.label || d.id}${d.role ? ` — ${d.role}` : ''}${(d.connections || 1) > 1 ? ` · ${d.connections} sessions` : ''}`)
+
     const label = svg.append('g')
       .selectAll('text')
       .data(nodes)
       .join('text')
-      .text(d => d.id.substring(0, 8))
+      .text(d => d.label || d.id)
       .attr('font-size', '10px')
       .attr('fill', d => d.id === graph.central ? '#fff' : 'var(--muted)')
       .attr('text-anchor', 'middle')

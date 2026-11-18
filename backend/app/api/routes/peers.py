@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.routes.auth import get_current_user
+from app.api.websockets.events_ws import manager
 from app.core.config import settings
 from app.core.network import net_io_snapshot
 from app.core.timeutil import utcnow
@@ -67,19 +68,24 @@ def discover(db: Session = Depends(get_db), user=Depends(get_current_user)):
 
 
 @router.get("/network/graph")
-def graph(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    peers = mark_stale(db)
-    now = utcnow()
-    nodes = [{"id": p.hostname, "ip": p.ip, "latency": p.latency_ms, "status": p.status,
-              "last_seen": p.last_seen.isoformat()} for p in peers]
-    nodes.append({"id": "server", "ip": "127.0.0.1", "latency": 0.5, "status": "online",
-                  "last_seen": now.isoformat()})
-    edges = [{"from": "server", "to": p.hostname, "latency": p.latency_ms} for p in peers]
-    isolated = [n["id"] for n in nodes if n["id"] != "server" and
-                (n.get("latency", 0) > 500 or n.get("status") == "offline")]
-    online = sum(1 for n in nodes if n["status"] == "online")
-    return {"nodes": nodes, "edges": edges, "isolated": isolated,
-            "central": "server", "online": online, "total": len(nodes)}
+def graph(user=Depends(get_current_user)):
+    """Live topology: the server plus every user with an open web session.
+
+    Presence comes from the WebSocket manager, so offline/stale rows in the
+    legacy Peer table can never leak into the graph.
+    """
+    now = utcnow().isoformat()
+    nodes = [{"id": "server", "label": "server", "role": "server", "ip": "127.0.0.1",
+              "latency": 0.0, "status": "online", "last_seen": now, "connections": 1}]
+    edges = []
+    for u in manager.online_snapshot()["users"]:
+        node_id = f"user:{u['username']}"
+        nodes.append({"id": node_id, "label": u["username"], "role": u["role"],
+                      "ip": "", "latency": 0.0, "status": "online", "last_seen": now,
+                      "connections": u["connections"]})
+        edges.append({"from": "server", "to": node_id, "latency": 0.0})
+    return {"nodes": nodes, "edges": edges, "isolated": [],
+            "central": "server", "online": len(nodes), "total": len(nodes)}
 
 
 @router.get("/network/stats")

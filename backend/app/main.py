@@ -137,10 +137,13 @@ async def ws_events(ws: WebSocket):
     with SessionLocal() as db:
         user = auth.user_from_token(token, db) if token else None
         username, admin = (user.username, auth.is_admin(user)) if user else ("", False)
+        role = (user.role or "") if user else ""
     if not user:
         await ws.close(code=4401, reason="invalid or expired token")
         return
-    conn = await manager.connect(ws, username, admin)
+    conn = await manager.connect(ws, username, admin, role=role,
+                                 ip=ws.client.host if ws.client else "")
+    await manager.announce_presence()
     try:
         while True:
             try:
@@ -167,3 +170,7 @@ async def ws_events(ws: WebSocket):
                 continue
     finally:
         manager.disconnect(conn)
+        try:
+            await manager.announce_presence()
+        except Exception:
+            log.debug("presence broadcast failed", exc_info=True)

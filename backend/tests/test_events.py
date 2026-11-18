@@ -45,15 +45,22 @@ def test_websocket_requires_token_and_filters_dm(client):
         with client.websocket_connect("/ws/events") as ws:
             ws.receive_json()
     dm = client.post("/api/messages/channels", json={"name": "", "type": "dm", "members": [b]}, headers=ha).json()
+
+    def next_event(ws):
+        while True:
+            frame = ws.receive_json()
+            if frame["event"] != "PRESENCE":   # live presence is interleaved
+                return frame
+
     with client.websocket_connect(f"/ws/events?token={tb}") as wsb, \
             client.websocket_connect(f"/ws/events?token={tc}") as wsc:
         client.post("/api/messages", json={"channel_id": dm["id"], "content": "secret"}, headers=ha)
-        frame = wsb.receive_json()
+        frame = next_event(wsb)
         assert frame["event"] == "MESSAGE_SENT" and frame["data"]["payload"]["text"] == "secret"
         assert frame["notify"] is True
         # outsider gets nothing about the DM; a public event arrives first instead
         client.post("/api/events", json={"type": "PUBLIC_PING"}, headers=ha)
-        assert wsc.receive_json()["event"] == "PUBLIC_PING"
+        assert next_event(wsc)["event"] == "PUBLIC_PING"
     # and the REST timeline hides it too
     texts = [e["payload"].get("text") for e in client.get("/api/events?limit=500", headers=hc).json()]
     assert "secret" not in texts
