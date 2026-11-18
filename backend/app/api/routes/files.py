@@ -592,7 +592,8 @@ def manifest(path: str, db: Session = Depends(get_db), user=Depends(get_current_
 
 
 @router.post("/sync/chunk")
-async def upload_chunk(file: UploadFile, path: str, index: int = Query(0, ge=0), total: int = Query(1, ge=1),
+async def upload_chunk(file: UploadFile, path: str, response: Response,
+                       index: int = Query(0, ge=0), total: int = Query(1, ge=1),
                        upload_id: str = Query("", max_length=64),
                        db: Session = Depends(get_db), user=Depends(get_current_user)):
     """Stage one chunk at its offset. Nothing reaches the root until /sync/complete."""
@@ -609,7 +610,21 @@ async def upload_chunk(file: UploadFile, path: str, index: int = Query(0, ge=0),
     stage = staging_path(user.username, rel, upload_id)
     # index 0 always opens a fresh session for legacy clients that send no upload_id
     write_chunk(stage, target, index, data, fresh=(index == 0 and not upload_id))
-    return {"ok": True, "chunk": index, "of": total, "sha": hashlib.sha256(data).hexdigest()}
+
+    # Apply Token Bucket QoS shaping (Priority 40 for background bulk chunk sync)
+    tb_result = await scheduler.token_bucket.consume(tokens=1.0, priority=40)
+    is_cong = tb_result["congested"]
+    response.headers["X-Congestion"] = "1" if is_cong else "0"
+
+    return {
+        "ok": True,
+        "chunk": index,
+        "of": total,
+        "sha": hashlib.sha256(data).hexdigest(),
+        "congested": is_cong,
+        "delay_ms": tb_result["delay_ms"],
+        "tokens_remaining": tb_result["tokens_remaining"],
+    }
 
 
 @router.post("/sync/complete")
